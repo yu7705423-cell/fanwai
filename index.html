@@ -414,7 +414,7 @@ input[type=range].off::-webkit-slider-thumb{border-color:var(--muted)}
   <a class="dlink" href="#/length"><svg class="icon"><use href="#i-ruler"/></svg>篇幅检测</a>
   <a class="dlink" href="#/taste"><svg class="icon"><use href="#i-chart"/></svg>口味画像</a>
   <a class="dlink" href="#/api"><svg class="icon"><use href="#i-key"/></svg>API 设置</a>
-  <a class="dlink" href="#/data"><svg class="icon"><use href="#i-save"/></svg>数据与联动</a>
+  <a class="dlink" href="#/data"><svg class="icon"><use href="#i-save"/></svg>数据备份</a>
 </nav>
 
 <div class="modal-mask" id="modal-mask"><div class="modal" id="modal"></div></div>
@@ -937,6 +937,7 @@ const Store = {
     if(this.settings.compileLevel === undefined)   await this.set('compileLevel', 'polish');
     if(this.settings.useApi === undefined)         await this.set('useApi', false);
     if(this.settings.readerUrl === undefined)      await this.set('readerUrl', READER_URL_DEFAULT);
+    if(this.settings.readerOn === undefined)       await this.set('readerOn', false);   // 联动是可选的，默认不出现
   },
 
   lexMap(){
@@ -2179,12 +2180,12 @@ function secPreview(){
       '<button class="btn xs" data-act="copy-prompt">' + icon('copy','sm') + '复制</button>' +
     '</span></div>' +
     '<div class="pv-body mono">' + esc(prompt) + '</div></div>';
-  html += '<div class="btnbar mb12">' +
-    '<button class="btn sm" data-act="send-reader">' + icon('share','sm') + '送到喵喵书阁</button>' +
-    '<button class="btn sm ghost" data-act="goto-data">书阁地址设置</button>' +
-  '</div>';
-  html += '<div class="note">约 ' + c.noSpace + ' 字（不含空白）。复制后可直接粘贴给任意模型，不依赖本工具。<br>' +
-    '「送到喵喵书阁」会把这条 Prompt 变成书阁里的一个指令，正文写好之后就挂在它下面。</div>';
+  if(Store.get('readerOn', false)){
+    html += '<div class="btnbar mb12">' +
+      '<button class="btn sm" data-act="send-reader">' + icon('share','sm') + '送到喵喵书阁</button>' +
+    '</div>';
+  }
+  html += '<div class="note">约 ' + c.noSpace + ' 字（不含空白）。复制后可直接粘贴给任意模型，不依赖本工具。</div>';
   html += '</div>';
   return html;
 }
@@ -2261,17 +2262,25 @@ document.addEventListener('input', (e) => {
   autosave();
 });
 document.addEventListener('change', async (e) => {
-  if(!Cur || !e.target.closest('#view')) return;
+  if(!e.target.closest('#view')) return;
   const el = e.target;
-  if(el.classList.contains('sl-on')) return onSlider(e);
   const host = el.closest('[data-path],[data-act]');
-  if(!host) return;
-  if(host.dataset.act === 'toggle-useapi'){
+  const act = host && host.dataset.act;
+  /* 设置类开关不依赖当前番外：没开过番外时也要能点 */
+  if(act === 'toggle-reader'){
+    await Store.set('readerOn', el.checked);
+    Router.go();
+    toast(el.checked ? '番外里会多一个「送到喵喵书阁」' : '已关闭，界面上不会再出现书阁相关的东西');
+    return;
+  }
+  if(act === 'toggle-useapi'){
     await Store.set('useApi', el.checked);
     toast(el.checked ? '生成时会调用 AI 整理' : '改为本地编译');
     return;
   }
-  if(!host.dataset.path) return;
+  if(!Cur) return;
+  if(el.classList.contains('sl-on')) return onSlider(e);
+  if(!host || !host.dataset.path) return;
   const v = (el.tagName === 'INPUT' && el.type === 'checkbox') ? el.checked : el.value;
   setPath(Cur, host.dataset.path, v);
   autosave();
@@ -2656,7 +2665,7 @@ function renderLibrary(){
           '<button class="btn xs" data-act="lib-selall">全选 / 取消</button>' +
           '<button class="btn xs" data-act="lib-move">移动到…</button>' +
           '<button class="btn xs" data-act="lib-exportsel">导出所选</button>' +
-          '<button class="btn xs" data-act="lib-sendsel">送到书阁</button>' +
+          (Store.get('readerOn', false) ? '<button class="btn xs" data-act="lib-sendsel">送到书阁</button>' : '') +
           '<button class="btn xs danger" data-act="lib-delsel">删除所选</button>' +
         '</div></div>'
       : '') +
@@ -3221,7 +3230,7 @@ Router.add('/taste', async () => {
    16. 数据备份
    ============================================================ */
 Router.add('/data', async () => {
-  setTitle('数据与联动');
+  setTitle('数据备份');
   const counts = {
     番外: Store.stories.length, 我的Prompt: Store.prompts.length, 模板: Store.templates.length,
     预设: Store.presets.length, 词典: Store.lexicon.length, 标签分类: Store.tagCats.length, API配置: Store.apis.length
@@ -3235,7 +3244,7 @@ Router.add('/data', async () => {
       '<button class="btn sm" data-act="data-import">' + icon('upload','sm') + '导入备份</button>' +
     '</div>' +
     '<div class="callout warn">导入只会解析 JSON 数据，不会执行文件里的任何代码。</div>' +
-    '<div class="sec-title">联动 · 喵喵书阁</div>' +
+    '<div class="sec-title">可选联动</div>' +
     readerLinkPanel() +
     '<div class="sec-title">危险操作</div>' +
     '<div class="btnbar"><button class="btn sm danger" data-act="data-clear">清空全部数据</button></div>' +
@@ -3243,25 +3252,32 @@ Router.add('/data', async () => {
   );
 });
 
+/* 联动是纯可选的：默认关着，关着的时候除了这个开关不会有任何书阁相关的东西。 */
 function readerLinkPanel(){
-  const raw = trim(Store.get('readerUrl', READER_URL_DEFAULT)) || READER_URL_DEFAULT;
-  const u = readerLink();
-  const ok = canHandoff();
-  return '<div class="card">' +
-    fieldHTML('书阁地址', '<input class="input" data-path-setting="readerUrl" value="' + attr(raw) + '" placeholder="' + attr(READER_URL_DEFAULT) + '">',
-      '相对地址即可，两个应用放在同一个站点下时用默认值就行') +
-    '<div class="callout' + (ok ? '' : ' warn') + '">' +
-      (ok
-        ? '当前可以直通：点「送到喵喵书阁」会直接写进书阁的收件箱并跳过去，书阁打开就收，不用导文件。'
-        : '当前不能直通' + (u ? ('（书阁在 ' + esc(u.origin) + '，这里是 ' + esc(location.origin) + '）') : '') +
-          '，点「送到喵喵书阁」会自动改成导出一个交接文件，到书阁的「导入」选它即可。') +
-    '</div>' +
-    '<div class="note">解析后的地址：' + esc(u ? u.href : '（填的地址无法解析）') + '</div>' +
-    '<div class="btnbar mt12">' +
-      '<button class="btn sm ghost" data-act="reader-open">打开书阁</button>' +
-      '<button class="btn sm ghost" data-act="reader-reset">恢复默认地址</button>' +
-    '</div>' +
-  '</div>';
+  const on = Store.get('readerOn', false);
+  let html = '<div class="card">' +
+    switchHTML(on, '送到喵喵书阁', '在番外里多一个按钮，把编译好的 Prompt 送进喵喵书阁存正文。不用书阁的话保持关闭就行。',
+      {act:'toggle-reader'});
+  if(on){
+    const raw = trim(Store.get('readerUrl', READER_URL_DEFAULT)) || READER_URL_DEFAULT;
+    const u = readerLink();
+    const direct = canHandoff();
+    html += '<div class="hr"></div>' +
+      fieldHTML('书阁地址', '<input class="input" data-path-setting="readerUrl" value="' + attr(raw) + '" placeholder="' + attr(READER_URL_DEFAULT) + '">',
+        '相对地址即可，两个应用放在同一个站点下时用默认值就行') +
+      '<div class="callout">' +
+        (direct
+          ? '现在是直通：点「送到喵喵书阁」直接写进书阁的收件箱并跳过去，书阁打开就收。'
+          : '现在走文件：点「送到喵喵书阁」会导出一个交接文件，到书阁的「设置 → 数据备份 → 导入」选它即可，一样能用。' +
+            (u ? '<br><span class="muted">（书阁在 ' + esc(u.origin) + '，这里是 ' + esc(location.origin) + '；放到同一个站点下就会变成直通。）</span>' : '')) +
+      '</div>' +
+      '<div class="note">解析后的地址：' + esc(u ? u.href : '（填的地址无法解析）') + '</div>' +
+      '<div class="btnbar mt12">' +
+        '<button class="btn sm ghost" data-act="reader-open">打开书阁</button>' +
+        '<button class="btn sm ghost" data-act="reader-reset">恢复默认地址</button>' +
+      '</div>';
+  }
+  return html + '</div>';
 }
 
 /* ============================================================
@@ -3294,7 +3310,7 @@ Router.add('/detail', async (id) => {
       '<button class="btn sm ghost" data-act="detail-export" data-id="' + attr(s.id) + '">' + icon('download','sm') + '导出 JSON</button>' +
       '<button class="btn sm ghost" data-act="detail-txt" data-id="' + attr(s.id) + '">导出 TXT</button>' +
       '<button class="btn sm ghost" data-act="detail-dup" data-id="' + attr(s.id) + '">复制一份</button>' +
-      '<button class="btn sm ghost" data-act="detail-send" data-id="' + attr(s.id) + '">' + icon('share','sm') + '送到书阁</button>' +
+      (Store.get('readerOn', false) ? '<button class="btn sm ghost" data-act="detail-send" data-id="' + attr(s.id) + '">' + icon('share','sm') + '送到书阁</button>' : '') +
       '<button class="btn sm ghost" data-act="detail-code" data-id="' + attr(s.id) + '">' + icon('share','sm') + '分享码</button>' +
       '<button class="btn sm danger" data-act="detail-del" data-id="' + attr(s.id) + '">删除</button>' +
     '</div>'
@@ -3452,7 +3468,7 @@ async function sendToReader(stories){
       bodyHTML:'<div class="note">这两个应用现在不在同一个网址下，没法直接送过去，已经导出成文件。<br><br>' +
         '到喵喵书阁的「设置 → 数据备份 → 导入」选这个文件就行，它认识这种格式，会直接建成指令。<br><br>' +
         '想要点一下就到：把两个应用放在同一个站点下（例如 GitHub Pages 的 <code>/fanwai/</code> 和 <code>/read/</code>），' +
-        '再到「数据与联动」里把书阁地址填对。</div>',
+        '再到「数据备份 → 送到喵喵书阁」里把书阁地址填对。</div>',
       actions:[{label:'知道了', value:null, primary:true}]
     });
     return;
