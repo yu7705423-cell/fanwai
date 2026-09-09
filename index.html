@@ -414,7 +414,7 @@ input[type=range].off::-webkit-slider-thumb{border-color:var(--muted)}
   <a class="dlink" href="#/length"><svg class="icon"><use href="#i-ruler"/></svg>篇幅检测</a>
   <a class="dlink" href="#/taste"><svg class="icon"><use href="#i-chart"/></svg>口味画像</a>
   <a class="dlink" href="#/api"><svg class="icon"><use href="#i-key"/></svg>API 设置</a>
-  <a class="dlink" href="#/data"><svg class="icon"><use href="#i-save"/></svg>数据备份</a>
+  <a class="dlink" href="#/data"><svg class="icon"><use href="#i-save"/></svg>数据与联动</a>
 </nav>
 
 <div class="modal-mask" id="modal-mask"><div class="modal" id="modal"></div></div>
@@ -838,6 +838,11 @@ const TEMPLATE_BODY_EXPANDED = [
   '{{FINAL}}'
 ].join('\n\n');
 
+/* 与喵喵书阁（read 仓库）的交接：同源时写它的 localStorage 收件箱，它自己会收 */
+const READER_INBOX_KEY = 'mmr_inbox_fanwai';
+const READER_URL_DEFAULT = '../read/';
+const READER_INBOX_MAX = 100;
+
 const CONTINUE_INSTRUCTION = '继续当前番外，从上一段最后一句无缝续写。不要重复前文。不要重新开始。不要总结。当前正文仍未达到目标篇幅，请继续自然展开人物互动、对白、场景、情绪与后续事件。';
 
 /* ============================================================
@@ -931,6 +936,7 @@ const Store = {
     if(this.settings.activeTemplateId === undefined) await this.set('activeTemplateId', 'tpl_default');
     if(this.settings.compileLevel === undefined)   await this.set('compileLevel', 'polish');
     if(this.settings.useApi === undefined)         await this.set('useApi', false);
+    if(this.settings.readerUrl === undefined)      await this.set('readerUrl', READER_URL_DEFAULT);
   },
 
   lexMap(){
@@ -2173,7 +2179,12 @@ function secPreview(){
       '<button class="btn xs" data-act="copy-prompt">' + icon('copy','sm') + '复制</button>' +
     '</span></div>' +
     '<div class="pv-body mono">' + esc(prompt) + '</div></div>';
-  html += '<div class="note">约 ' + c.noSpace + ' 字（不含空白）。复制后可直接粘贴给任意模型，不依赖本工具。</div>';
+  html += '<div class="btnbar mb12">' +
+    '<button class="btn sm" data-act="send-reader">' + icon('share','sm') + '送到喵喵书阁</button>' +
+    '<button class="btn sm ghost" data-act="goto-data">书阁地址设置</button>' +
+  '</div>';
+  html += '<div class="note">约 ' + c.noSpace + ' 字（不含空白）。复制后可直接粘贴给任意模型，不依赖本工具。<br>' +
+    '「送到喵喵书阁」会把这条 Prompt 变成书阁里的一个指令，正文写好之后就挂在它下面。</div>';
   html += '</div>';
   return html;
 }
@@ -2235,7 +2246,10 @@ Router.add('/story', async (id) => {
 });
 
 /* ---------- 编辑器事件 ---------- */
+const settingInput = debounce(async (key, value) => { await Store.set(key, value); }, 400);
 document.addEventListener('input', (e) => {
+  const setEl = e.target.closest('[data-path-setting]');
+  if(setEl && e.target.closest('#view')){ settingInput(setEl.dataset.pathSetting, e.target.value); return; }
   if(!Cur || !e.target.closest('#view')) return;
   const el = e.target;
   if(el.classList.contains('sl-val')) return onSlider(e);
@@ -2526,6 +2540,11 @@ const EditorActions = {
   async 'goto-api'(){ nav('/api'); },
   async 'goto-modules'(){ nav('/modules'); },
   async 'goto-length'(){ nav('/length'); },
+  async 'goto-data'(){ nav('/data'); },
+  async 'send-reader'(){
+    autosave.flush(); await Store.saveStory(Cur);
+    await sendToReader([Cur]);
+  },
   async 'compile'(){ await doCompile(Store.get('useApi', false) && !!Store.activeApi()); },
   async 'ai-tidy'(){
     if(!Store.activeApi()){
@@ -2637,6 +2656,7 @@ function renderLibrary(){
           '<button class="btn xs" data-act="lib-selall">全选 / 取消</button>' +
           '<button class="btn xs" data-act="lib-move">移动到…</button>' +
           '<button class="btn xs" data-act="lib-exportsel">导出所选</button>' +
+          '<button class="btn xs" data-act="lib-sendsel">送到书阁</button>' +
           '<button class="btn xs danger" data-act="lib-delsel">删除所选</button>' +
         '</div></div>'
       : '') +
@@ -3201,7 +3221,7 @@ Router.add('/taste', async () => {
    16. 数据备份
    ============================================================ */
 Router.add('/data', async () => {
-  setTitle('数据备份');
+  setTitle('数据与联动');
   const counts = {
     番外: Store.stories.length, 我的Prompt: Store.prompts.length, 模板: Store.templates.length,
     预设: Store.presets.length, 词典: Store.lexicon.length, 标签分类: Store.tagCats.length, API配置: Store.apis.length
@@ -3215,11 +3235,34 @@ Router.add('/data', async () => {
       '<button class="btn sm" data-act="data-import">' + icon('upload','sm') + '导入备份</button>' +
     '</div>' +
     '<div class="callout warn">导入只会解析 JSON 数据，不会执行文件里的任何代码。</div>' +
+    '<div class="sec-title">联动 · 喵喵书阁</div>' +
+    readerLinkPanel() +
     '<div class="sec-title">危险操作</div>' +
     '<div class="btnbar"><button class="btn sm danger" data-act="data-clear">清空全部数据</button></div>' +
     '<div class="note mt8">清空后会恢复到初始状态（默认标签池、词典、模板）。</div>'
   );
 });
+
+function readerLinkPanel(){
+  const raw = trim(Store.get('readerUrl', READER_URL_DEFAULT)) || READER_URL_DEFAULT;
+  const u = readerLink();
+  const ok = canHandoff();
+  return '<div class="card">' +
+    fieldHTML('书阁地址', '<input class="input" data-path-setting="readerUrl" value="' + attr(raw) + '" placeholder="' + attr(READER_URL_DEFAULT) + '">',
+      '相对地址即可，两个应用放在同一个站点下时用默认值就行') +
+    '<div class="callout' + (ok ? '' : ' warn') + '">' +
+      (ok
+        ? '当前可以直通：点「送到喵喵书阁」会直接写进书阁的收件箱并跳过去，书阁打开就收，不用导文件。'
+        : '当前不能直通' + (u ? ('（书阁在 ' + esc(u.origin) + '，这里是 ' + esc(location.origin) + '）') : '') +
+          '，点「送到喵喵书阁」会自动改成导出一个交接文件，到书阁的「导入」选它即可。') +
+    '</div>' +
+    '<div class="note">解析后的地址：' + esc(u ? u.href : '（填的地址无法解析）') + '</div>' +
+    '<div class="btnbar mt12">' +
+      '<button class="btn sm ghost" data-act="reader-open">打开书阁</button>' +
+      '<button class="btn sm ghost" data-act="reader-reset">恢复默认地址</button>' +
+    '</div>' +
+  '</div>';
+}
 
 /* ============================================================
    17. 番外详情（只读查看）
@@ -3251,6 +3294,7 @@ Router.add('/detail', async (id) => {
       '<button class="btn sm ghost" data-act="detail-export" data-id="' + attr(s.id) + '">' + icon('download','sm') + '导出 JSON</button>' +
       '<button class="btn sm ghost" data-act="detail-txt" data-id="' + attr(s.id) + '">导出 TXT</button>' +
       '<button class="btn sm ghost" data-act="detail-dup" data-id="' + attr(s.id) + '">复制一份</button>' +
+      '<button class="btn sm ghost" data-act="detail-send" data-id="' + attr(s.id) + '">' + icon('share','sm') + '送到书阁</button>' +
       '<button class="btn sm ghost" data-act="detail-code" data-id="' + attr(s.id) + '">' + icon('share','sm') + '分享码</button>' +
       '<button class="btn sm danger" data-act="detail-del" data-id="' + attr(s.id) + '">删除</button>' +
     '</div>'
@@ -3340,6 +3384,97 @@ async function manageFoldersModal(section){
 }
 
 /* ============================================================
+   18.5 送到喵喵书阁
+   两个应用都放在同一个站点下时（例如 GitHub Pages 的 /fanwai/ 与 /read/），
+   同源就能共用 localStorage：这边把指令写进书阁的收件箱再跳过去，书阁打开
+   就自己收进「指令」，不用来回导文件。不同源（各自本地打开、或换了域名）时
+   自动退回导出文件，书阁的「导入」认识同一种格式。
+   ============================================================ */
+function readerLink(){
+  const raw = trim(Store.get('readerUrl', READER_URL_DEFAULT)) || READER_URL_DEFAULT;
+  try{ return new URL(raw, location.href); }catch(e){ return null; }
+}
+function storageUsable(){
+  try{
+    const k = '__fw_probe__';
+    localStorage.setItem(k, '1'); localStorage.removeItem(k);
+    return true;
+  }catch(e){ return false; }
+}
+/* 直通的条件：书阁地址跟这里同源，而且 localStorage 真的能写 */
+function canHandoff(){
+  const u = readerLink();
+  return !!u && location.protocol !== 'file:' && u.origin === location.origin && storageUsable();
+}
+function readerItemFromStory(s){
+  const ver = s.promptVersions[s.currentPromptVersion - 1];
+  const prompt = ver ? ver.prompt : Compiler.render(s);
+  const note = [];
+  if(trim(s.brainDump)) note.push('【脑洞】\n' + trim(s.brainDump));
+  if(ver && trim(ver.understanding)) note.push('【AI 理解】\n' + trim(ver.understanding));
+  if(ver && trim(ver.direction)) note.push('【番外方向】\n' + trim(ver.direction));
+  return {
+    kind:'instruction',
+    id:'fw-' + s.id,                       // 稳定 id：改完再送是更新，不会堆重复指令
+    title: trim(s.title) || autoTitle(s),
+    prompt: prompt,
+    note: note.join('\n\n'),
+    tags: storyTagList(s),
+    source:{app:'fanwai', storyId:s.id, version:s.currentPromptVersion || 0, sentAt:now()}
+  };
+}
+function queueForReader(items){
+  let list = [];
+  try{
+    const raw = localStorage.getItem(READER_INBOX_KEY);
+    if(raw){
+      const data = JSON.parse(raw);
+      const prev = Array.isArray(data) ? data : (data && data.items);
+      if(Array.isArray(prev)) list = prev;
+    }
+  }catch(e){ list = []; }          // 收件箱里是坏数据就直接覆盖掉
+  items.forEach(it => {
+    const i = list.findIndex(x => x && x.id === it.id);
+    if(i >= 0) list[i] = it; else list.push(it);
+  });
+  if(list.length > READER_INBOX_MAX) list = list.slice(-READER_INBOX_MAX);
+  localStorage.setItem(READER_INBOX_KEY, JSON.stringify({type:'fanwai-to-meow', v:1, sentAt:now(), items:list}));
+}
+async function sendToReader(stories){
+  const list = (stories || []).filter(Boolean);
+  if(!list.length){ toast('没有可以送的番外'); return; }
+  const items = list.map(readerItemFromStory);
+  if(!canHandoff()){
+    downloadFile('fanwai-to-meow-' + today() + '.json',
+      JSON.stringify({type:'fanwai-to-meow', v:1, sentAt:now(), items:items}, null, 2));
+    await openModal({
+      title:'已导出交接文件',
+      bodyHTML:'<div class="note">这两个应用现在不在同一个网址下，没法直接送过去，已经导出成文件。<br><br>' +
+        '到喵喵书阁的「设置 → 数据备份 → 导入」选这个文件就行，它认识这种格式，会直接建成指令。<br><br>' +
+        '想要点一下就到：把两个应用放在同一个站点下（例如 GitHub Pages 的 <code>/fanwai/</code> 和 <code>/read/</code>），' +
+        '再到「数据与联动」里把书阁地址填对。</div>',
+      actions:[{label:'知道了', value:null, primary:true}]
+    });
+    return;
+  }
+  try{
+    queueForReader(items);
+  }catch(e){
+    toast('写不进书阁的收件箱：' + (e.message || '浏览器不让存'), 3600);
+    return;
+  }
+  const u = readerLink();
+  u.hash = '#inbox';
+  const w = window.open(u.href, 'meow-reader');
+  if(w){
+    try{ w.focus(); }catch(e){}
+    toast('已送出 ' + items.length + ' 条，书阁那边直接收');
+  }else{
+    toast('已放进书阁的收件箱，打开书阁就能看到（浏览器拦了新标签页）', 3600);
+  }
+}
+
+/* ============================================================
    19. 全局 actions
    ============================================================ */
 const GlobalActions = {
@@ -3386,6 +3521,11 @@ const GlobalActions = {
     const list = Store.stories.filter(s => LibState.sel.has(s.id));
     if(!list.length){ toast('先选几个番外'); return; }
     exportStories(list, 'fanwai-stories-' + list.length + '.json'); toast('已导出 ' + list.length + ' 条');
+  },
+  async 'lib-sendsel'(){
+    const list = Store.stories.filter(s => LibState.sel.has(s.id));
+    if(!list.length){ toast('先选几个番外'); return; }
+    await sendToReader(list);
   },
   async 'lib-delsel'(){
     if(!LibState.sel.size){ toast('先选几个番外'); return; }
@@ -3867,6 +4007,14 @@ Object.assign(GlobalActions, {
       toast('导入完成'); Router.go();
     }catch(e){ toast('导入失败：' + e.message, 4000); }
   },
+  async 'reader-open'(){
+    const u = readerLink();
+    if(!u){ toast('书阁地址填得不对，解析不出来'); return; }
+    window.open(u.href, 'meow-reader');
+  },
+  async 'reader-reset'(){
+    await Store.set('readerUrl', READER_URL_DEFAULT); Router.go(); toast('已恢复默认');
+  },
   async 'data-clear'(){
     if(!await confirmBox('清空全部数据', '这台设备上的所有番外、预设、Prompt、词典都会被删除，无法恢复。建议先导出备份。', '仍然清空', true)) return;
     const again = await confirmBox('再确认一次', '真的要清空吗？', '清空', true);
@@ -3903,6 +4051,9 @@ Object.assign(GlobalActions, {
     const s0 = Store.stories.find(x => x.id === el.dataset.id);
     const n = normalizeStory(Object.assign(clone(s0), {id:uid(), title:(trim(s0.title) || '未命名') + ' 副本', createdAt:now(), updatedAt:now()}));
     await Store.saveStory(n); toast('已复制一份'); nav('/story/' + n.id);
+  },
+  async 'detail-send'(el){
+    await sendToReader([Store.stories.find(x => x.id === el.dataset.id)]);
   },
   async 'detail-code'(el){
     const s = Store.stories.find(x => x.id === el.dataset.id);
