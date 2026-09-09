@@ -920,13 +920,13 @@ const Store = {
     if(!this.templates.length){
       const t = {
         id:'tpl_default', name:'默认模板', builtin:true, order:0,
-        body: DEFAULT_TEMPLATE_BODY, createdAt:now(), updatedAt:now(),
-        desc:'按默认模块顺序输出，未填写的模块自动省略。'
+        mode:'wrap', head:'', tail:'', body: DEFAULT_TEMPLATE_BODY, createdAt:now(), updatedAt:now(),
+        desc:'没有额外的固定开头结尾，直接输出本次番外的内容。'
       };
       const t2 = {
         id:'tpl_expanded', name:'分块展开模板', builtin:true, order:1,
-        body: TEMPLATE_BODY_EXPANDED, createdAt:now(), updatedAt:now(),
-        desc:'手动排布各个变量块，方便自己调整位置。空的变量会自动省略。'
+        mode:'advanced', head:'', tail:'', body: TEMPLATE_BODY_EXPANDED, createdAt:now(), updatedAt:now(),
+        desc:'高级：手动排布各个变量块。空的变量会自动省略。'
       };
       this.templates = [t, t2];
       await DB.bulkPut('promptTemplates', this.templates);
@@ -1475,13 +1475,31 @@ const Compiler = (function(){
     });
     return out.join('\n\n');
   }
+  function fillVars(text, P){
+    return String(text || '').replace(/\{\{(\w+)\}\}/g, (m, key) => (P[key] !== undefined ? P[key] : ''));
+  }
+  /* 模板有两种：
+     wrap —— 你自己的固定开头 + 本次番外的具体内容 + 你自己的固定结尾（常用）
+     advanced —— 直接用变量自己排布整篇（想换模块位置时才需要）
+     老模板没有 mode 字段：body 被改过就当 advanced，否则当 wrap。 */
+  function templateMode(tpl){
+    if(!tpl) return 'wrap';
+    if(tpl.mode) return tpl.mode;
+    const b = trim(tpl.body);
+    return (b && b !== '{{MODULES}}') ? 'advanced' : 'wrap';
+  }
   function render(s){
     const P = parts(s);
     P.MODULES = assembleModules(s, P);
     const tpl = Store.template(s.promptTemplateId);
-    let body = tpl && trim(tpl.body) ? tpl.body : '{{MODULES}}';
-    body = body.replace(/\{\{(\w+)\}\}/g, (m, key) => (P[key] !== undefined ? P[key] : ''));
-    return body.replace(/\n{3,}/g, '\n\n').replace(/[ \t]+\n/g, '\n').trim();
+    let out;
+    if(templateMode(tpl) === 'advanced'){
+      out = fillVars(trim(tpl.body) || '{{MODULES}}', P);
+    }else{
+      out = [fillVars(tpl && tpl.head, P), P.MODULES, fillVars(tpl && tpl.tail, P)]
+        .map(trim).filter(Boolean).join('\n\n');
+    }
+    return out.replace(/\n{3,}/g, '\n\n').replace(/[ \t]+\n/g, '\n').trim();
   }
 
   /* ---------- AI 理解 / 番外方向（本地生成） ---------- */
@@ -1555,7 +1573,7 @@ const Compiler = (function(){
     return uniq(pool).filter(t => known.has(t)).slice(0, 8);
   }
 
-  return {render, parts, understanding, direction, conflicts, related, translateTags, block, assembleModules};
+  return {render, parts, understanding, direction, conflicts, related, translateTags, block, assembleModules, templateMode};
 })();
 
 /* ---------- 字数统计 ---------- */
@@ -1600,6 +1618,40 @@ const Api = {
       if(m) extra = '（' + String(m).slice(0, 160) + '）';
     }catch(e){ if(typeof body === 'string' && body && body.length < 160) extra = '（' + body + '）'; }
     return (map[status] || ('请求失败，状态码 ' + status + '。')) + extra;
+  },
+  modelsEndpoint(cfg){
+    let b = trim(cfg.baseUrl).replace(/\s/g,'').replace(/\/+$/,'');
+    if(!b) return '';
+    b = b.replace(/\/chat\/completions$/, '');
+    if(/\/models$/.test(b)) return b;
+    if(/\/v\d+$/.test(b)) return b + '/models';
+    return b + '/v1/models';
+  },
+  /* 拉取可用模型列表。兼容 OpenAI 的 {data:[{id}]}、Gemini 的 {models:[{name}]}，
+     以及直接返回数组的服务。 */
+  async models(cfg){
+    const url = this.modelsEndpoint(cfg || {});
+    if(!url) throw new Error('先填 Base URL，才知道去哪里拉模型。');
+    const headers = {};
+    if(trim(cfg.apiKey)) headers['Authorization'] = 'Bearer ' + trim(cfg.apiKey);
+    let res;
+    try{
+      res = await fetch(url, {method:'GET', headers: headers});
+    }catch(e){
+      throw new Error('连不上接口地址，请检查网络、Base URL，或该服务是否允许浏览器直接调用（CORS）。');
+    }
+    const text = await res.text();
+    if(!res.ok) throw new Error(this.friendlyError(res.status, text));
+    let data;
+    try{ data = JSON.parse(text); }catch(e){ throw new Error('接口返回的不是有效的 JSON，无法解析模型列表。'); }
+    const arr = Array.isArray(data) ? data : (data.data || data.models || data.result || []);
+    if(!Array.isArray(arr)) throw new Error('没在返回里找到模型列表（既没有 data 也没有 models）。');
+    const ids = arr
+      .map(x => (typeof x === 'string') ? x : (x && (x.id || x.name || x.model)))
+      .filter(Boolean)
+      .map(id => String(id).replace(/^models\//, ''));
+    if(!ids.length) throw new Error('接口没有返回任何模型。');
+    return uniq(ids).sort();
   },
   async chat(messages, cfgIn, overrides){
     const cfg = cfgIn || Store.activeApi();
@@ -2822,44 +2874,89 @@ Router.add('/templates', async () => {
 function renderTemplates(){
   const active = Store.get('activeTemplateId');
   view(
-    '<div class="callout">模板决定最终 Prompt 的排布。变量会在编译时替换成实际内容，空的变量会被自动省略。<br>' +
-      '可用变量：' + TEMPLATE_VARS.map(v => '<code>' + esc(v) + '</code>').join(' ') + '<br>' +
-      '<code>{{MODULES}}</code> 表示按「模块顺序」设置组装的全部模块。</div>' +
+    '<div class="callout">模板 = <b>你自己那套固定的开头约束</b> ＋ 中间自动填入本次番外的具体内容 ＋ <b>固定的结尾约束</b>。<br>' +
+      '开头结尾每篇都一样，中间每篇都不同。可以存好几套，写不同类型的番外时换着用。</div>' +
     '<div class="btnbar mb12">' +
       '<button class="btn sm primary" data-act="tpl-new">' + icon('plus','sm') + '新建模板</button>' +
       '<button class="btn sm ghost" data-act="tpl-import">' + icon('upload','sm') + '导入</button>' +
       '<button class="btn sm ghost" data-act="tpl-export">' + icon('download','sm') + '导出</button>' +
       '<button class="btn sm ghost" data-act="tpl-reset">恢复默认模板</button>' +
     '</div>' +
-    Store.templates.map(t =>
-      '<div class="item">' +
+    Store.templates.map(t => {
+      const adv = Compiler.templateMode(t) === 'advanced';
+      const bits = adv ? ['高级模板'] :
+        [trim(t.head) ? '开头 ' + trim(t.head).replace(/\s+/g,' ').slice(0, 14) + '…' : '无固定开头',
+         trim(t.tail) ? '结尾 ' + trim(t.tail).replace(/\s+/g,' ').slice(0, 14) + '…' : '无固定结尾'];
+      return '<div class="item">' +
         '<div class="it-main" data-act="tpl-edit" data-id="' + attr(t.id) + '">' +
           '<div class="it-title">' + esc(t.name) + (t.id === active ? ' <span class="badge solid">默认</span>' : '') + '</div>' +
-          '<div class="it-sub">' + esc(trim(t.desc) || trim(t.body).slice(0, 40)) + '</div>' +
+          '<div class="it-sub">' + esc(bits.join(' · ')) + '</div>' +
         '</div>' +
         '<div class="it-actions">' +
           '<button class="iconbtn" data-act="tpl-default" data-id="' + attr(t.id) + '" title="设为默认">' + icon('check','sm') + '</button>' +
           '<button class="iconbtn" data-act="tpl-copy" data-id="' + attr(t.id) + '" title="复制一份">' + icon('copy','sm') + '</button>' +
           (t.builtin ? '' : '<button class="iconbtn" data-act="tpl-del" data-id="' + attr(t.id) + '" title="删除">' + icon('trash','sm') + '</button>') +
         '</div>' +
-      '</div>').join('')
+      '</div>';
+    }).join('') +
+    '<div class="note mt16">选中的模板在每个番外的「Prompt 设置」里可以单独换。</div>'
   );
 }
+const TEMPLATE_HEAD_SAMPLE = '接下来写一段番外，不计入主线。\n全程保持角色原本的说话方式和行为逻辑，不要为了剧情让人物突然变一个人。\n不要在正文前解释你要怎么写。';
+const TEMPLATE_TAIL_SAMPLE = '写完之后不要总结、不要点评、不要问我要不要继续。\n直接停在故事该停的地方。';
+
 async function editTemplateModal(t){
   const isNew = !t;
-  const item = t || {id:uid(), name:'', body:'{{MODULES}}', desc:'', order:Store.templates.length, createdAt:now()};
+  const item = t || {id:uid(), name:'', mode:'wrap', head:'', tail:'', body:'{{MODULES}}', desc:'',
+                     order:Store.templates.length, createdAt:now()};
+  const adv = Compiler.templateMode(item) === 'advanced';
   const r = await openModal({
     title: isNew ? '新建模板' : '编辑模板',
     bodyHTML:
-      fieldHTML('名称', '<input class="input" id="tp-name" data-autofocus value="' + attr(item.name) + '">') +
+      fieldHTML('名称', '<input class="input" id="tp-name" data-autofocus value="' + attr(item.name) + '" placeholder="例如：我的常用番外模板">') +
       fieldHTML('说明', '<input class="input" id="tp-desc" value="' + attr(item.desc || '') + '" placeholder="选填">') +
-      fieldHTML('模板内容', '<textarea class="textarea big mono" id="tp-body">' + esc(item.body) + '</textarea>') +
-      '<div class="note">变量：' + TEMPLATE_VARS.map(v => esc(v)).join(' ') + '</div>',
+      '<div id="tp-wrap"' + (adv ? ' hidden' : '') + '>' +
+        fieldHTML('开头<span class="hint">固定，每篇都放在最前面</span>',
+          '<textarea class="textarea" id="tp-head" placeholder="写你每次都要加的那几句约束">' + esc(item.head || '') + '</textarea>') +
+        '<div class="callout">' + icon('down','sm') + ' 中间：本次番外的具体内容自动填在这里<br>' +
+          '<span class="muted">脑洞、人物、关系、标签翻译、叙事、篇幅要求……按「模块顺序」里的设置组装，没填的部分自动省略。<br>' +
+          '不想要工具自带的那几段约束（番外执行规则 / 输出要求 / 最后确认）？到「模块顺序」里关掉，中间就只剩你自己的内容。</span></div>' +
+        fieldHTML('结尾<span class="hint">固定，每篇都放在最后面</span>',
+          '<textarea class="textarea" id="tp-tail" placeholder="写你每次都要加的收尾约束">' + esc(item.tail || '') + '</textarea>') +
+        '<div class="btnbar mb12"><button class="btn xs ghost" id="tp-sample">填入示例看看</button></div>' +
+      '</div>' +
+      '<div id="tp-adv"' + (adv ? '' : ' hidden') + '>' +
+        fieldHTML('完整模板', '<textarea class="textarea big mono" id="tp-body">' + esc(item.body || '{{MODULES}}') + '</textarea>') +
+        '<div class="note">变量：' + TEMPLATE_VARS.map(v => esc(v)).join(' ') + '<br>' +
+          '<code>{{MODULES}}</code> 是本次番外的全部内容。</div>' +
+      '</div>' +
+      '<label class="check mt8"><input type="checkbox" id="tp-mode"' + (adv ? ' checked' : '') + '><span class="box"></span>' +
+        '高级：直接用变量自己排布整篇</label>',
     actions:[{label:'取消', value:null},{label:'保存', primary:true, collect:(m) => {
       const name = trim($('#tp-name', m).value);
       if(!name){ toast('给模板起个名字'); return undefined; }
-      return {name, body: $('#tp-body', m).value, desc: trim($('#tp-desc', m).value)};
-    }}]
+      return {
+        name: name,
+        desc: trim($('#tp-desc', m).value),
+        mode: $('#tp-mode', m).checked ? 'advanced' : 'wrap',
+        head: $('#tp-head', m).value,
+        tail: $('#tp-tail', m).value,
+        body: $('#tp-body', m).value
+      };
+    }}],
+    onMount:(m) => {
+      const sync = () => {
+        const on = $('#tp-mode', m).checked;
+        $('#tp-adv', m).hidden = !on;
+        $('#tp-wrap', m).hidden = on;
+      };
+      $('#tp-mode', m).addEventListener('change', sync);
+      $('#tp-sample', m).addEventListener('click', () => {
+        $('#tp-head', m).value = TEMPLATE_HEAD_SAMPLE;
+        $('#tp-tail', m).value = TEMPLATE_TAIL_SAMPLE;
+        toast('填的是示例，按自己的习惯改');
+      });
+    }
   });
   if(!r) return;
   Object.assign(item, r, {updatedAt: now()});
@@ -3127,7 +3224,8 @@ function renderApi(){
 async function editApiModal(a){
   const isNew = !a;
   const item = a || {id:uid(), name:'', provider:'OpenAI 兼容', baseUrl:'https://api.openai.com/v1', apiKey:'',
-    model:'', temperature:0.7, maxTokens:4096, customParams:'', order:Store.apis.length, createdAt:now()};
+    model:'', temperature:0.7, maxTokens:4096, customParams:'', models:[], order:Store.apis.length, createdAt:now()};
+  let modelList = Array.isArray(item.models) ? item.models.slice() : [];   // 上次拉到的，省得每次重拉
   const r = await openModal({
     title: isNew ? '添加 API 配置' : '编辑 API 配置',
     bodyHTML:
@@ -3135,7 +3233,12 @@ async function editApiModal(a){
       fieldHTML('Provider', '<input class="input" id="ap-provider" value="' + attr(item.provider) + '" placeholder="仅作备注">') +
       fieldHTML('Base URL', '<input class="input" id="ap-url" value="' + attr(item.baseUrl) + '" placeholder="https://.../v1">', '支持 OpenAI 兼容接口') +
       fieldHTML('API Key', '<input class="input" id="ap-key" type="password" value="' + attr(item.apiKey) + '" placeholder="只保存在本机">') +
-      fieldHTML('Model', '<input class="input" id="ap-model" value="' + attr(item.model) + '" placeholder="例如：gpt-4o-mini">') +
+      fieldHTML('Model',
+        '<div class="row tight">' +
+          '<input class="input" id="ap-model" value="' + attr(item.model) + '" placeholder="例如：gpt-4o-mini">' +
+          '<button class="btn" id="ap-fetch" style="flex:0 0 auto">' + icon('refresh','sm') + '拉取模型</button>' +
+        '</div>') +
+      '<div id="ap-models" class="mb12"></div>' +
       '<div class="grid2">' +
         fieldHTML('Temperature', '<input class="input" id="ap-temp" type="number" step="0.1" min="0" max="2" value="' + attr(item.temperature) + '">') +
         fieldHTML('Max Tokens', '<input class="input" id="ap-max" type="number" step="128" min="128" value="' + attr(item.maxTokens) + '">') +
@@ -3149,9 +3252,54 @@ async function editApiModal(a){
       return {
         name, provider: trim($('#ap-provider', m).value), baseUrl: trim($('#ap-url', m).value),
         apiKey: trim($('#ap-key', m).value), model: trim($('#ap-model', m).value),
-        temperature: Number($('#ap-temp', m).value), maxTokens: Number($('#ap-max', m).value), customParams: params
+        temperature: Number($('#ap-temp', m).value), maxTokens: Number($('#ap-max', m).value),
+        customParams: params, models: modelList.slice(0, 500)
       };
-    }}]
+    }}],
+    onMount:(m) => {
+      const box = $('#ap-models', m);
+      const paint = (filter) => {
+        if(!modelList.length){ box.innerHTML = ''; return; }
+        const kw = trim(filter).toLowerCase();
+        const hit = kw ? modelList.filter(x => x.toLowerCase().indexOf(kw) >= 0) : modelList;
+        const shown = hit.slice(0, 60);
+        box.innerHTML =
+          '<div class="note mb8">拉到 ' + modelList.length + ' 个模型' +
+            (hit.length !== modelList.length ? '，匹配 ' + hit.length + ' 个' : '') + '，点一个填进去</div>' +
+          (modelList.length > 12
+            ? '<input class="input mb8" id="ap-mfilter" placeholder="筛选模型名" value="' + attr(filter || '') + '">' : '') +
+          '<div class="chips">' + shown.map(x =>
+            '<span class="chip' + (x === trim($('#ap-model', m).value) ? ' on' : '') + '" data-model="' + attr(x) + '">' +
+              esc(x) + '</span>').join('') + '</div>' +
+          (hit.length > shown.length ? '<div class="note mt8">还有 ' + (hit.length - shown.length) + ' 个，用上面的框筛一下</div>' : '');
+        const f = $('#ap-mfilter', m);
+        if(f){
+          f.addEventListener('input', debounce(() => {
+            const pos = f.selectionStart; paint(f.value);
+            const nf = $('#ap-mfilter', m); if(nf){ nf.focus(); nf.setSelectionRange(pos, pos); }
+          }, 200));
+        }
+        box.querySelectorAll('[data-model]').forEach(c => c.addEventListener('click', () => {
+          $('#ap-model', m).value = c.dataset.model;
+          paint(f ? f.value : '');
+        }));
+      };
+      paint('');
+      $('#ap-fetch', m).addEventListener('click', async () => {
+        const btn = $('#ap-fetch', m);
+        btn.disabled = true; btn.textContent = '拉取中…';
+        box.innerHTML = '';
+        try{
+          modelList = await Api.models({baseUrl: $('#ap-url', m).value, apiKey: $('#ap-key', m).value});
+          paint('');
+          toast('拉到 ' + modelList.length + ' 个模型');
+        }catch(err){
+          box.innerHTML = '<div class="callout warn">' + esc(err.message) + '</div>';
+        }finally{
+          btn.disabled = false; btn.innerHTML = icon('refresh','sm') + '拉取模型';
+        }
+      });
+    }
   });
   if(!r) return;
   Object.assign(item, r, {updatedAt:now()});
@@ -3666,7 +3814,9 @@ const GlobalActions = {
       let n = 0;
       for(const raw of arr){
         if(!raw || !trim(raw.name)) continue;
-        const t = {id:uid(), name:trim(raw.name), body:String(raw.body || '{{MODULES}}'), desc:String(raw.desc || ''),
+        const t = {id:uid(), name:trim(raw.name), mode: raw.mode === 'advanced' ? 'advanced' : 'wrap',
+          head:String(raw.head || ''), tail:String(raw.tail || ''),
+          body:String(raw.body || '{{MODULES}}'), desc:String(raw.desc || ''),
           order:Store.templates.length + n, createdAt:now()};
         Store.templates.push(t); await DB.put('promptTemplates', t); n++;
       }
@@ -3675,10 +3825,10 @@ const GlobalActions = {
   },
   async 'tpl-reset'(){
     if(!await confirmBox('恢复默认模板', '会重新写入两个内置模板，你自己建的模板不受影响。', '恢复')) return;
-    const t1 = {id:'tpl_default', name:'默认模板', builtin:true, order:0, body:DEFAULT_TEMPLATE_BODY,
-      desc:'按默认模块顺序输出，未填写的模块自动省略。', createdAt:now(), updatedAt:now()};
-    const t2 = {id:'tpl_expanded', name:'分块展开模板', builtin:true, order:1, body:TEMPLATE_BODY_EXPANDED,
-      desc:'手动排布各个变量块，方便自己调整位置。空的变量会自动省略。', createdAt:now(), updatedAt:now()};
+    const t1 = {id:'tpl_default', name:'默认模板', builtin:true, order:0, mode:'wrap', head:'', tail:'',
+      body:DEFAULT_TEMPLATE_BODY, desc:'没有额外的固定开头结尾，直接输出本次番外的内容。', createdAt:now(), updatedAt:now()};
+    const t2 = {id:'tpl_expanded', name:'分块展开模板', builtin:true, order:1, mode:'advanced', head:'', tail:'',
+      body:TEMPLATE_BODY_EXPANDED, desc:'高级：手动排布各个变量块。空的变量会自动省略。', createdAt:now(), updatedAt:now()};
     Store.templates = Store.templates.filter(t => t.id !== 'tpl_default' && t.id !== 'tpl_expanded').concat([t1, t2]);
     await DB.bulkPut('promptTemplates', [t1, t2]);
     Store.sortAll(); renderTemplates(); toast('已恢复');
@@ -4005,6 +4155,7 @@ Object.assign(GlobalActions, {
         const a = {id:uid(), name:trim(raw.name), provider:String(raw.provider || ''), baseUrl:String(raw.baseUrl || ''),
           apiKey:String(raw.apiKey || ''), model:String(raw.model || ''), temperature:Number(raw.temperature) || 0.7,
           maxTokens:Number(raw.maxTokens) || 4096, customParams:String(raw.customParams || ''),
+          models: Array.isArray(raw.models) ? raw.models.filter(x => typeof x === 'string') : [],
           order:Store.apis.length, createdAt:now()};
         Store.apis.push(a); await DB.put('apiConfigs', a); n++;
       }
