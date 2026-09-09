@@ -29,12 +29,18 @@
   --shadow:0 1px 2px rgba(28,25,23,.04);
   --font: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Helvetica Neue", Arial, sans-serif;
 }
+/* 深色：跟随系统；宿主显式指定 data-theme 时以它为准 */
 @media (prefers-color-scheme: dark){
-  :root{
+  :root:not([data-theme="light"]){
     --bg:#131211; --surface:#1a1918; --surface-2:#222120; --line:#2e2c2a; --line-strong:#3d3a37;
     --text:#ecebe9; --text-2:#b5b0ab; --muted:#7c7773; --accent:#ecebe9; --accent-soft:#2a2827;
     --danger:#c39a92; --ok:#9db09d; --shadow:none;
   }
+}
+:root[data-theme="dark"]{
+    --bg:#131211; --surface:#1a1918; --surface-2:#222120; --line:#2e2c2a; --line-strong:#3d3a37;
+    --text:#ecebe9; --text-2:#b5b0ab; --muted:#7c7773; --accent:#ecebe9; --accent-soft:#2a2827;
+    --danger:#c39a92; --ok:#9db09d; --shadow:none;
 }
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 html,body{margin:0;padding:0}
@@ -548,7 +554,31 @@ function safeFileName(base, ext){
   return b + ext;
 }
 function today(){ return new Date().toISOString().slice(0,10); }
-function downloadFile(filename, text, mime){
+/* 在 Claude Artifact 这类沙箱里，普通的下载链接是无效的：那里要走宿主提供的
+   保存流程。其它环境（本地打开、GitHub Pages）没有 window.claude，照旧下载。 */
+let _hostSave = undefined;
+async function hostDownloads(){
+  if(_hostSave !== undefined) return _hostSave;
+  _hostSave = null;
+  try{
+    if(window.claude && typeof window.claude.use === 'function'){
+      _hostSave = await window.claude.use('downloads');
+    }
+  }catch(e){ _hostSave = null; }
+  return _hostSave;
+}
+async function downloadFile(filename, text, mime){
+  const host = await hostDownloads();
+  if(host){
+    try{
+      await host.save({filename: filename, data: text});
+    }catch(err){
+      const code = err && err.code;
+      if(code === 'declined') return;            // 用户自己点了取消，不是错误
+      toast('没能保存文件：' + ((err && err.message) || '这个环境不允许保存'), 3600);
+    }
+    return;
+  }
   const blob = new Blob([text], {type: mime || 'application/json;charset=utf-8'});
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
