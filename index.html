@@ -416,6 +416,7 @@ input[type=range].off::-webkit-slider-thumb{border-color:var(--muted)}
   <a class="dlink" href="#/presets"><svg class="icon"><use href="#i-sliders"/></svg>预设</a>
   <a class="dlink" href="#/lexicon"><svg class="icon"><use href="#i-book2"/></svg>语义词典</a>
   <a class="dlink" href="#/tags"><svg class="icon"><use href="#i-tag"/></svg>标签池</a>
+  <a class="dlink" href="#/aiprompts"><svg class="icon"><use href="#i-spark"/></svg>AI 指令</a>
   <div class="dtitle">工具</div>
   <a class="dlink" href="#/length"><svg class="icon"><use href="#i-ruler"/></svg>篇幅检测</a>
   <a class="dlink" href="#/taste"><svg class="icon"><use href="#i-chart"/></svg>口味画像</a>
@@ -1903,6 +1904,45 @@ const AI_SYSTEM = [
   'JSON 结构：{"title":"（如果用户没写标题，给一个不超过12字的简短标题，否则原样返回）","understanding":"你对用户脑洞的理解，简短几行","direction":"这次番外的创作方向，简短几行","prompt":"最终可直接复制使用的完整 Prompt"}'
 ].join('\n');
 
+const TAGGEN_SYSTEM = [
+  '你在帮用户扩充一个「番外创作标签库」。标签是用来描述"想看什么感觉"的短词，不是写作指令。',
+  '要求：',
+  '1. 标签要短，2～10 个字，是嗑点、关系状态、情绪、剧情处境这类东西（例如：嘴上否认行动明显、久别重逢、被别人一眼看穿）。',
+  '2. 不要泛泛的形容词（例如"好看""有趣"），也不要写成句子或指令。',
+  '3. 每个标签配一条「行为语言」翻译：说清楚这个感觉具体怎么在故事里体现——什么行为、什么反应、通过什么细节，以及要避免的偏差。翻译是陈述句，30～80 字，不要用祈使句。',
+  '4. 翻译里不要出现标签本身的词，也不要下定义式的形容。',
+  '5. 只输出 JSON 数组，不要任何解释或代码块标记：[{"tag":"…","meaning":"…"}]'
+].join('\n');
+
+/* 所有发给模型的系统指令，用户可以自己改（改了存在 settings.aiPrompts）。
+   默认值要惰性取：STORYLINE_SYSTEM 在这行之后才声明。 */
+const AI_PROMPT_DEFS = [
+  {key:'compile',   name:'AI 整理 / 编译',   desc:'点「AI 整理」时给模型的系统指令：它负责把脑洞和标签编成最终 Prompt，而不是写番外。'},
+  {key:'storyline', name:'AI 编主线',        desc:'点「按标签编一条主线」时的系统指令：只要故事本身，不要写作指令。'},
+  {key:'taggen',    name:'AI 批量生成标签',  desc:'批量造标签时的系统指令：产出短标签 + 行为语言翻译。'},
+  {key:'level_raw',    name:'强度 · 原汁原味', level:true},
+  {key:'level_polish', name:'强度 · 轻度润色', level:true},
+  {key:'level_deep',   name:'强度 · 深度细化', level:true},
+  {key:'level_bold',   name:'强度 · 大胆扩展', level:true}
+];
+function aiPrompt(key){
+  const o = Store.get('aiPrompts', {}) || {};
+  const v = trim(o[key]);
+  return v || defaultAiPrompt(key);
+}
+function defaultAiPrompt(key){
+  if(key.indexOf('level_') === 0) return LEVEL_INSTRUCTION[key.slice(6)] || '';
+  if(key === 'compile') return AI_SYSTEM;
+  if(key === 'storyline') return STORYLINE_SYSTEM;
+  if(key === 'taggen') return TAGGEN_SYSTEM;
+  return '';
+}
+async function setAiPrompt(key, text){
+  const o = Object.assign({}, Store.get('aiPrompts', {}) || {});
+  if(trim(text)) o[key] = text; else delete o[key];
+  await Store.set('aiPrompts', o);
+}
+
 const LEVEL_INSTRUCTION = {
   raw:'编译强度：原汁原味。几乎不要改写用户的表达，只做最小整理与格式规范，不要补充新的细节。',
   polish:'编译强度：轻度润色。整理表达，让要求更清楚可执行，可以补少量必要细节，但不要扩展剧情。',
@@ -1944,10 +1984,117 @@ async function generateStoryline(story){
     '再强调一次：只输出那段剧情设定本身，不要任何指令性语句。'
   ].join('\n');
   const raw = await Api.chat([
-    {role:'system', content: STORYLINE_SYSTEM},
+    {role:'system', content: aiPrompt('storyline')},
     {role:'user', content: user}
   ], null, {temperature: 0.95});
   return trim(String(raw)).replace(/^["「『]|["」』]$/g, '');
+}
+
+/* AI 批量生成标签：产出短标签 + 行为语言翻译，两边一起进标签池和语义词典 */
+async function generateTags(catName, theme, count){
+  const existing = Store.allTags().map(x => x.tag);
+  const user = [
+    '分类：' + catName,
+    theme ? ('方向 / 主题：' + theme) : '方向：贴着这个分类本身的意思来',
+    '数量：' + count + ' 个',
+    '',
+    '已经有的标签（不要重复，也不要只改一两个字的近义词）：',
+    existing.join('、') || '（暂时没有）'
+  ].join('\n');
+  const raw = await Api.chat([
+    {role:'system', content: aiPrompt('taggen')},
+    {role:'user', content: user}
+  ], null, {temperature: 0.95});
+  const data = extractJsonLoose(raw);
+  const arr = Array.isArray(data) ? data : (data && (data.tags || data.data));
+  if(!Array.isArray(arr) || !arr.length) throw new Error('模型没有按要求返回标签列表，可以到「AI 指令」里把要求写得更明确。');
+  const seen = new Set();
+  return arr.map(x => {
+    if(typeof x === 'string') return {tag: trim(x), meaning: ''};
+    return {tag: trim(x && (x.tag || x.name)), meaning: trim(x && (x.meaning || x.desc || x.text))};
+  }).filter(x => {
+    if(!x.tag || x.tag.length > 20 || seen.has(x.tag)) return false;
+    seen.add(x.tag); return true;
+  });
+}
+async function tagGenFlow(catId){
+  if(!Store.activeApi()){
+    const go = await confirmBox('需要先配置 API', '批量生成标签要调用模型。现在去配置吗？（不用 AI 也可以自己「+ 添加」。）', '去配置');
+    if(go) nav('/api');
+    return;
+  }
+  const cats = Store.tagCats;
+  const setup = await openModal({
+    title:'AI 批量生成标签',
+    bodyHTML:
+      fieldHTML('加到哪个分类', '<select class="input" id="tg-cat">' +
+        optionsHTML(cats.map(c => ({v:c.id, t:c.name})), catId || (cats[0] || {}).id) + '</select>') +
+      fieldHTML('想要什么方向<span class="hint">可留空</span>',
+        '<input class="input" id="tg-theme" data-autofocus placeholder="例如：师徒、久别重逢、职场里的权力拉扯">') +
+      fieldHTML('生成几个', '<input class="input" type="number" id="tg-count" min="1" max="30" value="10">') +
+      '<label class="check"><input type="checkbox" id="tg-lex" checked><span class="box"></span>同时生成行为语言翻译（推荐）</label>' +
+      '<div class="note mt8">没有翻译的标签在最终 Prompt 里只能当方向词用，有翻译才会被展开成具体要求。</div>',
+    actions:[{label:'取消', value:null},{label:'生成', primary:true, collect:(m) => ({
+      catId: $('#tg-cat', m).value,
+      theme: trim($('#tg-theme', m).value),
+      count: Math.max(1, Math.min(30, Number($('#tg-count', m).value) || 10)),
+      lex: $('#tg-lex', m).checked
+    })}]
+  });
+  if(!setup) return;
+  const cat = Store.tagCats.find(c => c.id === setup.catId);
+  if(!cat){ toast('分类不存在'); return; }
+  let list = [];
+  toast('正在生成…');
+  try{ list = await generateTags(cat.name, setup.theme, setup.count); }
+  catch(e){ toast(String(e.message || e), 4600); return; }
+  while(true){
+    const known = new Set(Store.allTags().map(x => x.tag));
+    const r = await openModal({
+      title:'生成了 ' + list.length + ' 个',
+      bodyHTML: list.map((x, i) => {
+        const dup = known.has(x.tag);
+        return '<label class="check" style="align-items:flex-start;margin-bottom:12px">' +
+          '<input type="checkbox" class="tg-pick" data-i="' + i + '"' + (dup ? '' : ' checked') + '><span class="box"></span>' +
+          '<span><span class="sw-label">' + esc(x.tag) + (dup ? ' <span class="badge">已有</span>' : '') + '</span>' +
+          (x.meaning ? '<br><span class="sw-desc">' + esc(x.meaning) + '</span>' : '<br><span class="sw-desc muted">（没有翻译）</span>') +
+          '</span></label>';
+      }).join('') + '<div class="note">加进「' + esc(cat.name) + '」' + (setup.lex ? '，翻译一并存进语义词典' : '') + '。</div>',
+      actions:[
+        {label:'取消', value:null},
+        {label:'再来一批', collect:() => ({act:'again'})},
+        {label:'加入选中', primary:true, collect:(m) => ({act:'add',
+          picked: $$('.tg-pick', m).filter(c => c.checked).map(c => list[Number(c.dataset.i)])})}
+      ]
+    });
+    if(!r) return;
+    if(r.act === 'again'){
+      toast('再生成一批…');
+      try{ list = await generateTags(cat.name, setup.theme, setup.count); }
+      catch(e){ toast(String(e.message || e), 4600); return; }
+      continue;
+    }
+    const picked = r.picked || [];
+    if(!picked.length){ toast('一个都没选'); return; }
+    let nTag = 0, nLex = 0;
+    for(const x of picked){
+      if(cat.tags.indexOf(x.tag) < 0){ cat.tags.push(x.tag); nTag++; }
+      if(setup.lex && x.meaning){
+        const exist = Store.lexicon.find(l => l.tag === x.tag);
+        if(exist){ exist.meaning = x.meaning; exist.updatedAt = now(); await DB.put('lexicon', exist); }
+        else{
+          const l = {id:uid(), tag:x.tag, meaning:x.meaning, builtin:false, order:Store.lexicon.length, createdAt:now()};
+          Store.lexicon.push(l); await DB.put('lexicon', l);
+        }
+        nLex++;
+      }
+    }
+    await DB.put('tagpool', cat);
+    toast('加了 ' + nTag + ' 个标签' + (nLex ? '，' + nLex + ' 条翻译' : ''));
+    if(Router.current === '/tags') renderTagPool();
+    else if(Cur) renderEditor();
+    return;
+  }
 }
 
 async function aiCompile(story){
@@ -1960,7 +2107,7 @@ async function aiCompile(story){
     本地已编译的Prompt: basePrompt
   };
   const user = [
-    LEVEL_INSTRUCTION[story.compileLevel] || LEVEL_INSTRUCTION.polish,
+    aiPrompt('level_' + (story.compileLevel || 'polish')),
     trim(story.brainDump)
       ? ''
       : '\n用户这次没有写脑洞，只给了标签。请先根据这些标签编出一条具体的主线（谁、什么处境、发生了什么、转折和落点），把它写成一段连贯的话放在 Prompt 的主体位置，而不是把标签罗列出来。',
@@ -1971,7 +2118,7 @@ async function aiCompile(story){
     '注意：「本地已编译的Prompt」已经包含全部必要模块与限制条款，你的工作是在保留其结构与全部限制的前提下，让语言更自然、更连贯、更可执行。不要删除任何限制条款，不要加入你自己的写作示范。'
   ].join('\n');
   const raw = await Api.chat([
-    {role:'system', content: AI_SYSTEM},
+    {role:'system', content: aiPrompt('compile')},
     {role:'user', content: user}
   ]);
   const parsed = extractJson(raw);
@@ -1982,6 +2129,16 @@ async function aiCompile(story){
     direction: trim(parsed.direction) || Compiler.direction(story),
     prompt: trim(parsed.prompt)
   };
+}
+function extractJsonLoose(text){
+  const t = String(text || '').replace(/^```(?:json)?/i,'').replace(/```$/,'').trim();
+  try{ return JSON.parse(t); }catch(e){}
+  const pairs = [['[',']'], ['{','}']];
+  for(const [a, b] of pairs){
+    const i = t.indexOf(a), j = t.lastIndexOf(b);
+    if(i >= 0 && j > i){ try{ return JSON.parse(t.slice(i, j + 1)); }catch(e){} }
+  }
+  return null;
 }
 function extractJson(text){
   const t = String(text || '').replace(/^```(?:json)?/i,'').replace(/```$/,'').trim();
@@ -2055,6 +2212,37 @@ function selectHTML(list, value, dataset){
 }
 function fieldHTML(label, inner, hint){
   return '<div class="field"><label class="lb">' + esc(label) + (hint ? '<span class="hint">' + esc(hint) + '</span>' : '') + '</label>' + inner + '</div>';
+}
+/* 内置选项 + 用户自己加的。所有 chip 组和带「+」的下拉框都走这里，
+   加过一次就一直在，不用每个番外重填。 */
+function optList(key){
+  const extra = (Store.get('optExtra', {}) || {})[key] || [];
+  const base = OPT[key] || [];
+  return base.concat(extra.filter(x => base.indexOf(x) < 0));
+}
+async function addOptValues(key, raw){
+  const vals = splitInput(raw).filter(Boolean);
+  if(!vals.length) return [];
+  const all = Object.assign({}, Store.get('optExtra', {}) || {});
+  const cur = (all[key] || []).slice();
+  const base = OPT[key] || [];
+  const added = [];
+  vals.forEach(v => { if(base.indexOf(v) < 0 && cur.indexOf(v) < 0){ cur.push(v); added.push(v); } });
+  all[key] = cur;
+  await Store.set('optExtra', all);
+  return added.length ? added : vals;
+}
+/* chip 组末尾带一个「+ 添加」，加进去的是这一组的公共选项 */
+function optChips(key, selected, dataset, label){
+  const ds = Object.keys(dataset || {}).map(k => ' data-' + k + '="' + attr(dataset[k]) + '"').join('');
+  const sel = new Set(selected || []);
+  const list = optList(key);
+  /* 已经选中但不在公共选项里的（老数据、别处导入的），也要显示出来 */
+  (selected || []).forEach(v => { if(trim(v) && list.indexOf(v) < 0) list.push(v); });
+  return '<div class="chips">' +
+    list.map(t => '<span class="chip' + (sel.has(t) ? ' on' : '') + '"' + ds + ' data-tag="' + attr(t) + '">' + esc(t) + '</span>').join('') +
+    '<span class="chip add" data-act="add-opt" data-optkey="' + attr(key) + '">' + icon('plus','sm') + (label || '添加') + '</span>' +
+  '</div>';
 }
 function chipsHTML(list, selected, dataset, extraClass){
   const sel = new Set(selected || []);
@@ -2215,12 +2403,12 @@ const autosave = debounce(async () => {
   if(!Cur.currentPromptVersion) refreshPreview();  // 实时预览跟着改
 }, 500);
 
-function selectCustomHTML(list, value, path, placeholder){
-  const opts = list.slice();
-  if(trim(value) && opts.indexOf(value) < 0 && opts.map(o => (typeof o === 'string' ? o : o.v)).indexOf(value) < 0) opts.push(value);
+function selectCustomHTML(optKey, value, path){
+  const opts = optList(optKey).slice();
+  if(trim(value) && opts.indexOf(value) < 0) opts.push(value);
   return '<div class="row tight" style="align-items:center">' +
     '<select class="input" data-path="' + attr(path) + '">' + optionsHTML(opts, value) + '</select>' +
-    '<button class="iconbtn" style="flex:none" data-act="custom-opt" data-target="' + attr(path) + '" title="自定义">' + icon('plus','sm') + '</button>' +
+    '<button class="iconbtn" style="flex:none" data-act="custom-opt" data-target="' + attr(path) + '" data-optkey="' + attr(optKey) + '" title="自定义">' + icon('plus','sm') + '</button>' +
   '</div>';
 }
 function addChipsHTML(values, path, placeholder, filterFn){
@@ -2244,6 +2432,7 @@ function secTags(){
   html += '<div class="sec-title">选标签 <span class="badge">' + chosen.length + '</span></div>';
   html += '<div class="btnbar mb12">' +
       '<button class="btn sm" data-act="random-draw">' + icon('dice','sm') + '随机抽取</button>' +
+      '<button class="btn sm" data-act="tag-ai">' + icon('spark','sm') + 'AI 生成标签</button>' +
       '<button class="btn sm ghost" data-act="clear-tags">清空标签</button>' +
       '<button class="btn sm ghost" data-act="goto-tags">管理标签池</button>' +
     '</div>';
@@ -2254,8 +2443,10 @@ function secTags(){
   }
   cats.forEach(c => {
     const sel = (s.tags[c.key] || []);
+    const addChip = '<span class="chip add" data-act="add-cat-tag" data-id="' + attr(c.id) + '">' + icon('plus','sm') + '添加</span>';
+    const chips = chipsHTML(c.tags, sel, {tagcat: c.key}).replace(/<\/div>$/, addChip + '</div>');
     html += foldHTML('tag-' + c.key, c.name, sel.length ? sel.join('、') : '',
-      chipsHTML(c.tags, sel, {tagcat: c.key}), sel.length > 0 || c.key === 'emotion');
+      chips, sel.length > 0 || c.key === 'emotion');
   });
   html += '<div class="field mt12"><label class="lb">自定义标签<span class="hint">想到什么写什么</span></label>' +
     addChipsHTML(s.customTags, 'customTags', '例如：雨夜、旧照片、没说出口的那句话') + '</div>';
@@ -2273,19 +2464,18 @@ function personHTML(label, key){
     '<div class="sec-title" style="margin:0 0 10px">' + esc(label) + '</div>' +
     fieldHTML('名称', '<input class="input" data-path="' + path + '.name" value="' + attr(p.name) + '" placeholder="留空则沿用当前上下文">') +
     '<div class="grid2">' +
-      fieldHTML('性别', selectCustomHTML(OPT.gender, p.gender, path + '.gender')) +
-      fieldHTML('性取向', selectCustomHTML(OPT.orientation, p.orientation, path + '.orientation')) +
+      fieldHTML('性别', selectCustomHTML('gender', p.gender, path + '.gender')) +
+      fieldHTML('性取向', selectCustomHTML('orientation', p.orientation, path + '.orientation')) +
     '</div>' +
     '<div class="grid2">' +
-      fieldHTML('年龄阶段', selectCustomHTML(OPT.age, p.age, path + '.age')) +
-      fieldHTML('身份', selectCustomHTML(OPT.identity, p.identity, path + '.identity')) +
+      fieldHTML('年龄阶段', selectCustomHTML('age', p.age, path + '.age')) +
+      fieldHTML('身份', selectCustomHTML('identity', p.identity, path + '.identity')) +
     '</div>' +
     '<div class="grid2">' +
       fieldHTML('职业', '<input class="input" data-path="' + path + '.job" value="' + attr(p.job) + '" placeholder="选填">') +
       fieldHTML('社会位置', '<input class="input" data-path="' + path + '.social" value="' + attr(p.social) + '" placeholder="选填">') +
     '</div>' +
-    fieldHTML('性格', chipsHTML(OPT.personality, p.personality, {multi: path + '.personality'})) +
-    fieldHTML('', addChipsHTML(p.personality, path + '.personality', '自定义性格', (v) => OPT.personality.indexOf(v) < 0)) +
+    fieldHTML('性格', optChips('personality', p.personality, {multi: path + '.personality'})) +
     '<div class="grid2">' +
       fieldHTML('气质', '<input class="input" data-path="' + path + '.temperament" value="' + attr(p.temperament) + '" placeholder="选填">') +
       fieldHTML('其他补充', '<input class="input" data-path="' + path + '.extra" value="' + attr(p.extra) + '" placeholder="选填">') +
@@ -2342,7 +2532,7 @@ function secCharacters(){
 function secRelationship(){
   const r = Cur.relationship;
   const defs = Store.get('sliderDefs', DEFAULT_SLIDERS);
-  let body = fieldHTML('当前关系', selectCustomHTML(OPT.relation, r.current, 'relationship.current'));
+  let body = fieldHTML('当前关系', selectCustomHTML('relation', r.current, 'relationship.current'));
   body += '<div class="sec-title">关系动态</div><div class="note mb12">勾选后才会写进 Prompt；不勾就保持开放。</div>';
   body += defs.map(d => sliderHTML(d, (r.sliders || {})[d.key], 'relationship')).join('');
   body += '<div class="btnbar mb12"><button class="btn xs ghost" data-act="edit-sliders">编辑滑块</button></div>';
@@ -2359,20 +2549,20 @@ function secRelationship(){
 function secWorld(){
   const w = Cur.world;
   let body = '<div class="grid2">' +
-    fieldHTML('时代', selectCustomHTML(OPT.era, w.era, 'world.era')) +
-    fieldHTML('世界类型', selectCustomHTML(OPT.world, w.type, 'world.type')) +
+    fieldHTML('时代', selectCustomHTML('era', w.era, 'world.era')) +
+    fieldHTML('世界类型', selectCustomHTML('world', w.type, 'world.type')) +
   '</div>';
-  body += fieldHTML('社会结构 / 身份差', selectCustomHTML(OPT.social, w.social, 'world.social'));
+  body += fieldHTML('社会结构 / 身份差', selectCustomHTML('social', w.social, 'world.social'));
   body += '<div class="grid2">' +
     fieldHTML('CHAR 的身份位置', '<input class="input" data-path="world.charIdentity" value="' + attr(w.charIdentity) + '" placeholder="选填">') +
     fieldHTML('USER 的身份位置', '<input class="input" data-path="world.userIdentity" value="' + attr(w.userIdentity) + '" placeholder="选填">') +
   '</div>';
-  body += fieldHTML('场景', chipsHTML(OPT.scene, w.scenes, {multi:'world.scenes'}));
+  body += fieldHTML('场景', optChips('scene', w.scenes, {multi:'world.scenes'}));
   body += fieldHTML('', '<input class="input" data-path="world.sceneCustom" value="' + attr(w.sceneCustom) + '" placeholder="自定义场景，用顿号分隔">');
   body += '<div class="sec-title">参考作品</div>';
   body += fieldHTML('文学参考', addChipsHTML(w.literary, 'world.literary', '例如：《呼啸山庄》'),
     '只取气质与叙事方式，不复刻原作');
-  body += fieldHTML('影视 / 动漫 / 游戏类型', chipsHTML(OPT.screen, w.screen, {multi:'world.screen'}));
+  body += fieldHTML('影视 / 动漫 / 游戏类型', optChips('screen', w.screen, {multi:'world.screen'}));
   body += fieldHTML('想要类似什么感觉', '<textarea class="textarea" data-path="world.screenFeel" placeholder="例如：想要那种黄昏公路片、话很少但情绪很满的感觉">' + esc(w.screenFeel) + '</textarea>');
   const note = [val2(w.era), val2(w.type), nonEmpty(w.scenes)[0]].filter(Boolean).slice(0, 3).join('、');
   return foldHTML('world', '世界观 / 场景 / 参考', note, body, false);
@@ -2380,32 +2570,32 @@ function secWorld(){
 function secNarrative(){
   const n = Cur.narrative, v = Cur.visual, vb = Cur.vibe;
   const defs = Store.get('narrativeDefs', DEFAULT_NARRATIVE_SLIDERS);
-  let body = fieldHTML('整体氛围', chipsHTML(OPT.vibe, vb.moods, {multi:'vibe.moods'}));
+  let body = fieldHTML('整体氛围', optChips('vibe', vb.moods, {multi:'vibe.moods'}));
   body += fieldHTML('', '<input class="input" data-path="vibe.custom" value="' + attr(vb.custom) + '" placeholder="自定义氛围，用顿号分隔">');
   body += '<div class="sec-title">叙事方式</div><div class="note mb12">勾选后才会写进 Prompt。</div>';
   body += defs.map(d => sliderHTML(d, (n.sliders || {})[d.key], 'narrative')).join('');
   body += '<div class="grid2">' +
-    fieldHTML('POV', selectCustomHTML(OPT.pov, n.pov, 'narrative.pov')) +
-    fieldHTML('信息差', selectCustomHTML(OPT.infoGap, n.infoGap, 'narrative.infoGap')) +
+    fieldHTML('POV', selectCustomHTML('pov', n.pov, 'narrative.pov')) +
+    fieldHTML('信息差', selectCustomHTML('infoGap', n.infoGap, 'narrative.infoGap')) +
   '</div>';
-  body += fieldHTML('风格', chipsHTML(OPT.style, n.styles, {multi:'narrative.styles'}));
+  body += fieldHTML('风格', optChips('style', n.styles, {multi:'narrative.styles'}));
   body += '<div class="sec-title">视觉氛围</div>';
   body += '<div class="grid2">' +
-    fieldHTML('季节', selectCustomHTML(OPT.season, v.season, 'visual.season')) +
-    fieldHTML('时间', selectCustomHTML(OPT.time, v.time, 'visual.time')) +
+    fieldHTML('季节', selectCustomHTML('season', v.season, 'visual.season')) +
+    fieldHTML('时间', selectCustomHTML('time', v.time, 'visual.time')) +
   '</div><div class="grid2">' +
-    fieldHTML('天气', selectCustomHTML(OPT.weather, v.weather, 'visual.weather')) +
-    fieldHTML('色调', selectCustomHTML(OPT.tone, v.tone, 'visual.tone')) +
+    fieldHTML('天气', selectCustomHTML('weather', v.weather, 'visual.weather')) +
+    fieldHTML('色调', selectCustomHTML('tone', v.tone, 'visual.tone')) +
   '</div>';
   return foldHTML('narr', '氛围 / 叙事 / 视觉', nonEmpty(vb.moods).slice(0,3).join('、'), body, false);
 }
 function secEnding(){
   const e = Cur.extra;
-  let body = fieldHTML('结局倾向', selectCustomHTML(OPT.ending, Cur.ending, 'ending'), '不选就不强制任何结局');
+  let body = fieldHTML('结局倾向', selectCustomHTML('ending', Cur.ending, 'ending'), '不选就不强制任何结局');
   body += '<div class="sec-title">偷偷加一点料</div>';
   body += switchHTML(e.on, '允许加入一点额外元素', '不会覆盖你明确写下的要求', {path:'extra.on', refresh:'ending'});
   if(e.on){
-    body += fieldHTML('钩子来源', chipsHTML(OPT.hooks, e.hooks, {multi:'extra.hooks'}));
+    body += fieldHTML('钩子来源', optChips('hooks', e.hooks, {multi:'extra.hooks'}));
     body += fieldHTML('', '<input class="input" data-path="extra.custom" value="' + attr(e.custom) + '" placeholder="自定义钩子，用顿号分隔">');
     body += fieldHTML('强度', chipsHTML(OPT.hookLevel, [e.level], {single:'extra.level'}));
   }
@@ -2416,7 +2606,7 @@ function secEnding(){
 }
 function secLength(){
   const L = Cur.length;
-  let body = fieldHTML('目标篇幅', chipsHTML(OPT.lengthTarget, [L.target], {single:'length.target'}));
+  let body = fieldHTML('目标篇幅', optChips('lengthTarget', [L.target], {single:'length.target'}));
   body += fieldHTML('自定义字数', '<input class="input" type="number" min="0" step="100" data-path="length.custom" value="' + attr(L.custom) + '" placeholder="留空则用上面的选择">');
   body += switchHTML(L.strict, '严格篇幅模式', '把目标字数当成最低完成线：不到不收尾、不总结、不跳剧情、不虚报字数', {path:'length.strict'});
   body += switchHTML(L.segmented, '长篇分段模式', '一次写不完就在场景断点停下，下次无缝续写', {path:'length.segmented'});
@@ -2818,11 +3008,32 @@ const EditorActions = {
     await Store.saveStory(Cur); renderEditor();
   },
   async 'custom-opt'(el){
-    const path = el.dataset.target;
-    const v = await promptBox('自定义', '', {placeholder:'输入你自己的内容'});
+    const path = el.dataset.target, key = el.dataset.optkey;
+    const v = await promptBox('自定义', '', {placeholder:'输入你自己的内容', desc:'加进去之后这一项会一直在选项里。'});
     if(!trim(v)) return;
-    setPath(Cur, path, trim(v));
+    const added = key ? await addOptValues(key, v) : [trim(v)];
+    setPath(Cur, path, added[0] || trim(v));
     await Store.saveStory(Cur); renderEditor();
+  },
+  async 'add-opt'(el){
+    const key = el.dataset.optkey;
+    const v = await promptBox('添加选项', '', {placeholder:'可以一次写多个，用逗号分隔', desc:'加进去之后这一组里就一直有它。'});
+    if(!trim(v)) return;
+    const added = await addOptValues(key, v);
+    await Store.saveStory(Cur); renderEditor();
+    toast('已添加 ' + added.length + ' 个');
+  },
+  async 'add-cat-tag'(el){
+    const c = Store.tagCats.find(x => x.id === el.dataset.id);
+    if(!c) return;
+    const v = await promptBox('添加标签到「' + c.name + '」', '', {placeholder:'可以一次写多个，用逗号分隔'});
+    if(!trim(v)) return;
+    const added = [];
+    splitInput(v).forEach(t => { if(c.tags.indexOf(t) < 0){ c.tags.push(t); added.push(t); } });
+    await DB.put('tagpool', c);
+    added.forEach(t => toggleTag(Cur, c.key, t));     // 加完顺手选上
+    await Store.saveStory(Cur); renderEditor();
+    toast(added.length ? '已添加并选中 ' + added.length + ' 个' : '这些标签已经有了');
   },
   async 'add-other'(){
     Cur.characters.others.push({id:uid(), name:'', gender:'未指定', age:'未指定', identity:'', job:'', personality:'', relation:'', extra:''});
@@ -3411,12 +3622,37 @@ async function editLexModal(l){
   renderLexicon(''); toast('已保存');
 }
 
+Router.add('/aiprompts', async () => { setTitle('AI 指令'); renderAiPrompts(); });
+function renderAiPrompts(){
+  const custom = Store.get('aiPrompts', {}) || {};
+  view(
+    '<div class="callout">这些是本工具调用模型时发过去的系统指令。觉得哪句限制得太死或者不够，直接改。<br>' +
+      '改坏了可以随时「恢复默认」。不用 API 的话，这一页跟你没关系。</div>' +
+    AI_PROMPT_DEFS.map(d =>
+      '<div class="item" style="align-items:flex-start">' +
+        '<div class="it-main" data-act="aip-edit" data-key="' + attr(d.key) + '">' +
+          '<div class="it-title">' + esc(d.name) + (trim(custom[d.key]) ? ' <span class="badge">已改</span>' : '') + '</div>' +
+          '<div class="it-sub" style="white-space:normal;line-height:1.6">' +
+            esc(d.desc || trim(aiPrompt(d.key)).replace(/\s+/g,' ').slice(0, 46) + '…') + '</div>' +
+        '</div>' +
+        (trim(custom[d.key])
+          ? '<div class="it-actions"><button class="iconbtn" data-act="aip-reset" data-key="' + attr(d.key) + '" title="恢复默认">' + icon('refresh','sm') + '</button></div>'
+          : '') +
+      '</div>').join('') +
+    '<div class="btnbar mt16">' +
+      '<button class="btn sm ghost" data-act="aip-export">' + icon('download','sm') + '导出</button>' +
+      '<button class="btn sm ghost" data-act="aip-import">' + icon('upload','sm') + '导入</button>' +
+      '<button class="btn sm ghost" data-act="aip-resetall">全部恢复默认</button>' +
+    '</div>'
+  );
+}
 Router.add('/tags', async () => { setTitle('标签池'); renderTagPool(); });
 function renderTagPool(){
   view(
     '<div class="callout">这里加的标签会同步进入随机抽取池。你也可以新建自己的分类。</div>' +
     '<div class="btnbar mb12">' +
       '<button class="btn sm primary" data-act="tag-newcat">' + icon('plus','sm') + '新建分类</button>' +
+      '<button class="btn sm" data-act="tag-ai">' + icon('spark','sm') + 'AI 批量生成</button>' +
       '<button class="btn sm ghost" data-act="tag-import">' + icon('upload','sm') + '导入</button>' +
       '<button class="btn sm ghost" data-act="tag-export">' + icon('download','sm') + '导出</button>' +
       '<button class="btn sm ghost" data-act="tag-reset">恢复默认标签池</button>' +
@@ -3424,6 +3660,7 @@ function renderTagPool(){
     Store.tagCats.map((c, i) => foldHTML('pool-' + c.key, c.name, c.tags.length + ' 个',
       '<div class="btnbar mb12">' +
         '<button class="btn xs" data-act="tag-add" data-id="' + attr(c.id) + '">' + icon('plus','sm') + '添加标签</button>' +
+        '<button class="btn xs" data-act="tag-ai" data-id="' + attr(c.id) + '">' + icon('spark','sm') + 'AI 生成</button>' +
         '<button class="btn xs ghost" data-act="cat-rename" data-id="' + attr(c.id) + '">重命名</button>' +
         '<button class="btn xs ghost" data-act="cat-up" data-i="' + i + '">上移</button>' +
         '<button class="btn xs ghost" data-act="cat-down" data-i="' + i + '">下移</button>' +
@@ -3433,9 +3670,26 @@ function renderTagPool(){
         '<span class="chip" data-act="tag-edit" data-id="' + attr(c.id) + '" data-i="' + ti + '">' + esc(t) +
           '<span class="x" data-act="tag-del" data-id="' + attr(c.id) + '" data-i="' + ti + '">' + icon('close','sm') + '</span></span>').join('') +
       '</div><div class="note mt8">点标签可以重命名或调整顺序。</div>', false)).join('') +
+    '<div class="sec-title">其它选项组</div>' +
+    '<div class="note mb12">人物性格、场景、影视类型、氛围、风格、钩子、篇幅这些组，也可以在番外里直接「+ 添加」。这里能看到和删掉自己加过的。</div>' +
+    optGroupsHTML() +
     '<div class="note tac mt16">共 ' + Store.allTags().length + ' 个标签</div>'
   );
   restoreFolds();
+}
+const OPT_GROUP_NAMES = {personality:'人物性格', scene:'场景', screen:'影视类型', vibe:'氛围', style:'风格',
+  hooks:'钩子来源', lengthTarget:'篇幅', gender:'性别', orientation:'性取向', age:'年龄阶段', identity:'身份',
+  relation:'当前关系', era:'时代', world:'世界类型', social:'社会结构', pov:'POV', infoGap:'信息差',
+  season:'季节', time:'时间', weather:'天气', tone:'色调', ending:'结局倾向'};
+function optGroupsHTML(){
+  const extra = Store.get('optExtra', {}) || {};
+  const keys = Object.keys(extra).filter(k => (extra[k] || []).length);
+  if(!keys.length) return '<div class="note">还没有自己加过的选项。</div>';
+  return keys.map(k =>
+    '<div class="card tight"><div class="fs13 mb8">' + esc(OPT_GROUP_NAMES[k] || k) + '</div><div class="chips">' +
+      extra[k].map((v, i) => '<span class="chip static">' + esc(v) +
+        '<span class="x" data-act="opt-del" data-optkey="' + attr(k) + '" data-i="' + i + '">' + icon('close','sm') + '</span></span>').join('') +
+    '</div></div>').join('');
 }
 
 Router.add('/sliders', async () => { setTitle('滑块设置'); renderSliders(); });
@@ -4169,6 +4423,48 @@ async function moveStoreItem(storeKey, id, dir, rerender){
 }
 
 Object.assign(GlobalActions, {
+  /* ---- AI 指令 ---- */
+  async 'aip-edit'(el){
+    const key = el.dataset.key;
+    const d = AI_PROMPT_DEFS.find(x => x.key === key) || {name:key};
+    const text = await promptBox(d.name, aiPrompt(key), {multiline:true, allowEmpty:true,
+      desc:(d.desc || '') + ' 留空表示用默认。'});
+    if(text === null) return;
+    await setAiPrompt(key, text);
+    renderAiPrompts(); toast('已保存');
+  },
+  async 'aip-reset'(el){
+    await setAiPrompt(el.dataset.key, '');
+    renderAiPrompts(); toast('已恢复默认');
+  },
+  async 'aip-resetall'(){
+    if(!await confirmBox('全部恢复默认', '你改过的 AI 指令都会被还原。', '恢复', true)) return;
+    await Store.set('aiPrompts', {});
+    renderAiPrompts(); toast('已全部恢复');
+  },
+  async 'aip-export'(){
+    const o = {};
+    AI_PROMPT_DEFS.forEach(d => { o[d.key] = aiPrompt(d.key); });
+    downloadFile('fanwai-ai-prompts.json', JSON.stringify({type:'fanwai-ai-prompts', version:1, prompts:o}, null, 2));
+    toast('已导出');
+  },
+  async 'aip-import'(){
+    const f = await readFile('.json');
+    if(!f) return;
+    try{
+      const data = JSON.parse(f.text);
+      const o = (data && data.prompts) || data;
+      if(!o || typeof o !== 'object') throw new Error('文件里没有 prompts 对象。');
+      const next = Object.assign({}, Store.get('aiPrompts', {}) || {});
+      let n = 0;
+      AI_PROMPT_DEFS.forEach(d => {
+        if(typeof o[d.key] === 'string' && trim(o[d.key])){ next[d.key] = o[d.key]; n++; }
+      });
+      await Store.set('aiPrompts', next);
+      renderAiPrompts(); toast('导入了 ' + n + ' 条');
+    }catch(e){ toast('导入失败：' + e.message, 4000); }
+  },
+
   /* ---- 预设 ---- */
   async 'ps-new'(){
     const name = await promptBox('新建预设', '', {placeholder:'例如：电影感番外'});
@@ -4304,6 +4600,7 @@ Object.assign(GlobalActions, {
     const c = {id:uid(), key:'c' + uid(), name:trim(name), builtin:false, tags:[], order:Store.tagCats.length, createdAt:now()};
     Store.tagCats.push(c); await DB.put('tagpool', c); renderTagPool(); toast('已创建');
   },
+  async 'tag-ai'(el){ await tagGenFlow(el.dataset.id || ''); },
   async 'tag-add'(el){
     const c = Store.tagCats.find(x => x.id === el.dataset.id);
     const v = await promptBox('添加标签到「' + c.name + '」', '', {placeholder:'可以一次写多个，用逗号分隔'});
@@ -4344,6 +4641,14 @@ Object.assign(GlobalActions, {
   },
   async 'cat-up'(el){ moveItem(Store.tagCats, +el.dataset.i, -1); await DB.bulkPut('tagpool', Store.tagCats); renderTagPool(); },
   async 'cat-down'(el){ moveItem(Store.tagCats, +el.dataset.i, 1); await DB.bulkPut('tagpool', Store.tagCats); renderTagPool(); },
+  async 'opt-del'(el){
+    const k = el.dataset.optkey, i = Number(el.dataset.i);
+    const all = Object.assign({}, Store.get('optExtra', {}) || {});
+    if(!all[k]) return;
+    all[k] = all[k].slice(); all[k].splice(i, 1);
+    await Store.set('optExtra', all);
+    renderTagPool();
+  },
   async 'tag-export'(){
     downloadFile('fanwai-tagpool.json', JSON.stringify({type:'fanwai-tagpool', version:1,
       categories: Store.tagCats.map(c => ({name:c.name, tags:c.tags}))}, null, 2));
