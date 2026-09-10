@@ -1910,6 +1910,46 @@ const LEVEL_INSTRUCTION = {
   bold:'编译强度：大胆扩展。在完全不改变核心脑洞的前提下，可以补充层次、钩子与可选的推进方式，让 Prompt 更有发挥空间。'
 };
 
+/* 让 AI 把选中的标签编成一条具体主线 —— 输出的是「故事本身」，
+   不是写作指令：有人物处境、有事件、有因果和转折，像自己手写要求那样。 */
+const STORYLINE_SYSTEM = [
+  '你在帮用户把零散的梗，写成一段可以直接拿去让模型写番外的「剧情设定」。',
+  '硬性要求：',
+  '1. 输出的是故事本身：谁、在什么处境里、发生了什么、为什么会这样、转折在哪、最后落在哪一刻。',
+  '2. 用一段连贯的话写完，像人自己手写要求那样。不要分点、不要小标题、不要用【】。',
+  '3. 不要写正文，不要写对白，不要写景物描写——这是设定，不是小说。',
+  '4. 不要出现任何写作指令（例如"请注意""要体现""不少于多少字"），也不要解释你的思路。',
+  '5. 不要复述标签名，把标签变成具体的事件和处境。',
+  '6. 长度 150～400 字。只输出这段设定，前后不要加任何多余的话。'
+].join('\n');
+
+async function generateStoryline(story){
+  const {translated, plain} = Compiler.translateTags(story);
+  const info = {
+    梗与感觉: translated.map(t => t.tag + '（' + t.text + '）').concat(plain),
+    人物: trim(Compiler.parts(story).CHARACTERS) || '(未指定，可以只用 CHAR 和 USER 指代)',
+    世界与场景: trim(Compiler.parts(story).WORLD) || '(未指定)',
+    关系: trim(Compiler.parts(story).RELATIONSHIP) || '(未指定)',
+    氛围与结局倾向: [trim(Compiler.parts(story).VIBE), trim(Compiler.parts(story).ENDING)].filter(Boolean).join(' ') || '(未指定)'
+  };
+  const existing = trim(story.brainDump);
+  const user = [
+    existing
+      ? '用户已经写了这些，请在完全保留它的核心意图的前提下，把它补成一条更完整、更具体的主线：\n' + existing
+      : '用户没有写脑洞，请只根据下面这些梗，编一条具体的主线。',
+    '',
+    '可用的材料：',
+    JSON.stringify(info, null, 1),
+    '',
+    '再强调一次：只输出那段剧情设定本身，不要任何指令性语句。'
+  ].join('\n');
+  const raw = await Api.chat([
+    {role:'system', content: STORYLINE_SYSTEM},
+    {role:'user', content: user}
+  ], null, {temperature: 0.95});
+  return trim(String(raw)).replace(/^["「『]|["」』]$/g, '');
+}
+
 async function aiCompile(story){
   const basePrompt = Compiler.render(story);
   const payload = {
@@ -1921,6 +1961,9 @@ async function aiCompile(story){
   };
   const user = [
     LEVEL_INSTRUCTION[story.compileLevel] || LEVEL_INSTRUCTION.polish,
+    trim(story.brainDump)
+      ? ''
+      : '\n用户这次没有写脑洞，只给了标签。请先根据这些标签编出一条具体的主线（谁、什么处境、发生了什么、转折和落点），把它写成一段连贯的话放在 Prompt 的主体位置，而不是把标签罗列出来。',
     '',
     '以下是结构化输入，请据此产出 JSON：',
     JSON.stringify(payload, null, 1),
@@ -1969,6 +2012,7 @@ const Router = {
     $('#actionbar-slot').innerHTML = '';
     window.scrollTo(0, 0);
     $$('.dlink').forEach(a => a.classList.toggle('on', a.getAttribute('href') === '#' + r.path));
+    $('#btn-back').classList.toggle('hidden', r.path === '/');   // 首页没地方可返回
     closeDrawer();
     try{
       await fn(r.arg, r.arg2);
@@ -2486,6 +2530,10 @@ function renderEditor(){
     '<div class="card">' +
       '<label class="lb" style="font-size:13px;font-weight:600;color:var(--text)">我就想看这个</label>' +
       '<textarea class="textarea big" data-path="brainDump" placeholder="想到什么写什么，不用整理。">' + esc(s.brainDump) + '</textarea>' +
+      '<div class="btnbar mt8">' +
+        '<button class="btn sm" data-act="ai-storyline">' + icon('spark','sm') +
+          (trim(s.brainDump) ? '让 AI 补完这条主线' : '让 AI 按标签编一条主线') + '</button>' +
+      '</div>' +
       '<div class="note mt8">这段的优先级最高。工具只会整理表达，不会改掉你的核心意图。</div>' +
     '</div>' +
     secTags() +
@@ -2848,6 +2896,52 @@ const EditorActions = {
     await sendToReader([Cur]);
   },
   async 'compile'(){ await doCompile(Store.get('useApi', false) && !!Store.activeApi()); },
+  async 'ai-storyline'(){
+    if(!Store.activeApi()){
+      const go = await confirmBox('需要先配置 API', '编主线要调用模型。现在去配置吗？（不配置的话，自己在上面写一句话也能生成 Prompt。）', '去配置');
+      if(go) nav('/api');
+      return;
+    }
+    if(!storyTagList(Cur).length && !trim(Cur.brainDump)){
+      toast('先选几个标签，或者随便写一句想看的'); return;
+    }
+    const btn = $('[data-act="ai-storyline"]');
+    const restore = btn ? btn.innerHTML : '';
+    const spin = (on) => { if(btn){ btn.disabled = on; btn.innerHTML = on ? '正在编…' : restore; } };
+    let text = '';
+    spin(true);
+    try{ text = await generateStoryline(Cur); }
+    catch(e){ spin(false); toast(String(e.message || e), 4200); return; }
+    spin(false);
+    while(true){
+      const r = await openModal({
+        title:'AI 编的主线',
+        bodyHTML:'<textarea class="textarea big" id="sl-text">' + esc(text) + '</textarea>' +
+          '<div class="note mt8">可以直接在这里改。「用这条」会写进上面的脑洞框。</div>',
+        actions:[
+          {label:'取消', value:null},
+          {label:'换一条', collect:(m) => ({act:'again', text: $('#sl-text', m).value})},
+          {label:'追加', collect:(m) => ({act:'append', text: $('#sl-text', m).value})},
+          {label:'用这条', primary:true, collect:(m) => ({act:'replace', text: $('#sl-text', m).value})}
+        ]
+      });
+      if(!r) return;
+      if(r.act === 'again'){
+        toast('再编一条…');
+        try{ text = await generateStoryline(Cur); }
+        catch(e){ toast(String(e.message || e), 4200); return; }
+        continue;
+      }
+      const t = trim(r.text);
+      if(!t){ toast('内容是空的'); return; }
+      Cur.brainDump = r.act === 'append' && trim(Cur.brainDump)
+        ? trim(Cur.brainDump) + '\n' + t : t;
+      await Store.saveStory(Cur);
+      renderEditor();
+      toast(r.act === 'append' ? '已追加到脑洞' : '已写进脑洞');
+      return;
+    }
+  },
   async 'ai-tidy'(){
     if(!Store.activeApi()){
       const go = await confirmBox('还没有配置 API', '「AI 整理」需要一个 OpenAI 兼容接口。现在去配置吗？没有 API 也可以直接用「生成 Prompt」的本地编译。', '去配置');
