@@ -833,10 +833,11 @@ const RELATED_TAGS = {
 };
 
 /* Prompt 模块（顺序可调） */
+/* 顺序的重点：先说清楚「这一篇具体要什么」，约束类的往后放。
+   脑洞紧跟开场，跟自己手写要求时的语序一致。 */
 const DEFAULT_MODULES = [
   {key:'customPrompts', name:'用户前置 Prompt', enabled:true},
   {key:'opening',       name:'开场指令',        enabled:true},
-  {key:'rules',         name:'番外执行规则',    enabled:true},
   {key:'idea',          name:'用户脑洞',        enabled:true},
   {key:'characters',    name:'人物信息',        enabled:true},
   {key:'world',         name:'世界信息',        enabled:true},
@@ -844,6 +845,7 @@ const DEFAULT_MODULES = [
   {key:'tags',          name:'标签翻译',        enabled:true},
   {key:'narrative',     name:'叙事要求',        enabled:true},
   {key:'length',        name:'篇幅要求',        enabled:true},
+  {key:'rules',         name:'番外执行规则',    enabled:true},
   {key:'output',        name:'输出要求',        enabled:true},
   {key:'final',         name:'最终检查',        enabled:true}
 ];
@@ -959,12 +961,13 @@ const Store = {
     }
     if(this.settings.openingCommand === undefined) await this.set('openingCommand', OPENING_DEFAULT);
     if(this.settings.openingExtra === undefined)   await this.set('openingExtra', OPENING_EXTRA_DEFAULT);
-    if(this.settings.openingExtraOn === undefined) await this.set('openingExtraOn', true);
+    if(this.settings.openingExtraOn === undefined) await this.set('openingExtraOn', false);
     if(this.settings.modules === undefined)        await this.set('modules', clone(DEFAULT_MODULES));
     if(this.settings.sliderDefs === undefined)     await this.set('sliderDefs', clone(DEFAULT_SLIDERS));
     if(this.settings.narrativeDefs === undefined)  await this.set('narrativeDefs', clone(DEFAULT_NARRATIVE_SLIDERS));
     if(this.settings.activeTemplateId === undefined) await this.set('activeTemplateId', 'tpl_default');
     if(this.settings.compileLevel === undefined)   await this.set('compileLevel', 'polish');
+    if(this.settings.promptStyle === undefined)    await this.set('promptStyle', 'natural');
     if(this.settings.useApi === undefined)         await this.set('useApi', false);
     if(this.settings.readerUrl === undefined)      await this.set('readerUrl', READER_URL_DEFAULT);
     if(this.settings.readerOn === undefined)       await this.set('readerOn', false);   // 联动是可选的，默认不出现
@@ -1027,6 +1030,8 @@ function newStory(section){
     customPromptIds:[],
     promptTemplateId: st.activeTemplateId || 'tpl_default',
     compileLevel: st.compileLevel || 'polish',
+    promptStyle: st.promptStyle || 'natural',       // natural = 连贯的一段话；structured = 【】分区
+
     promptVersions:[], currentPromptVersion:0,
     notes:'',
     sourceInfo:{sharer:'', source:'', link:'', importedAt:'', author:'', note:''},
@@ -1436,6 +1441,196 @@ const Compiler = (function(){
     return list.map(p => trim(p.content)).filter(Boolean).join('\n\n');
   }
 
+  /* ---------- 自然段落形态 ----------
+     把同样的信息写成连贯的话，而不是【】分区 + 逐条罗列。
+     重心是「这一篇具体要什么」，元指令压到最少。 */
+  function joinSentences(list, sep){
+    const out = (list || []).map(trim).filter(Boolean);
+    if(!out.length) return '';
+    return out.join(sep || '；') + '。';
+  }
+  function proseIdea(s){
+    const raw = trim(s.brainDump);
+    return raw;                      // 用户自己写的东西，原样放在最前面
+  }
+  /* 返回 {text, rich}：rich 表示除了名字之外还写了别的，只有名字时不值得加那句「没写到的保持未知」 */
+  function personProse(s, label, p){
+    const bits = [];
+    const nm = val(p.name);
+    const who = nm ? nm + '（' + label + '）' : label;
+    const id = [orCustom(p.identity, p.identityCustom), val(p.job)].filter(Boolean).join('、');
+    const base = [];
+    if(val(p.gender)) base.push(val(p.gender) + '性');
+    if(orCustom(p.age, p.ageCustom)) base.push(orCustom(p.age, p.ageCustom));
+    if(id) base.push(id);
+    if(base.length) bits.push(who + '是' + base.join('、'));
+    const per = nonEmpty(p.personality);
+    const tem = val(p.temperament);
+    if(per.length || tem) bits.push((bits.length ? '' : who) + '性格' + [per.join('、'), tem].filter(Boolean).join('、'));
+    if(val(p.social)) bits.push((bits.length ? '' : who) + '的社会位置是' + val(p.social));
+    if(val(p.orientation)) bits.push((bits.length ? '' : who) + '性取向' + val(p.orientation) + '，不要中途改变');
+    if(val(p.extra)) bits.push(val(p.extra));
+    if(bits.length) return {text: bits.join('，'), rich: true};
+    return nm ? {text: label + ' 是' + nm, rich: false} : {text: '', rich: false};
+  }
+  function proseCharacters(s){
+    const c = s.characters, lines = [];
+    if(c.mode === 'group') lines.push('这是一篇群像，多个角色一起承担剧情，不要把重心压到某一对关系上');
+    else if(c.mode === 'multi') lines.push('出场角色不止两个，每个人都要有自己的目的和反应');
+    const a = personProse(s, 'CHAR', c.char), b = personProse(s, 'USER', c.user);
+    let rich = a.rich || b.rich;
+    if(a.text) lines.push(a.text);
+    if(b.text) lines.push(b.text);
+    (c.others || []).forEach(o => {
+      const bits = [];
+      if(val(o.identity) || val(o.job)) bits.push([val(o.identity), val(o.job)].filter(Boolean).join('、'));
+      if(val(o.personality)) bits.push(val(o.personality));
+      if(val(o.relation)) bits.push(val(o.relation));
+      if(val(o.extra)) bits.push(val(o.extra));
+      if(val(o.name)){ lines.push(val(o.name) + (bits.length ? '：' + bits.join('，') : ' 也会出场')); rich = rich || bits.length > 0; }
+    });
+    const names = personNameMap(s);
+    (c.relations || []).filter(r => trim(r.desc)).forEach(r => {
+      const f = names[r.from] || r.from, t = names[r.to] || r.to;
+      if(f && t) lines.push(f + '对' + t + '：' + trim(r.desc));
+    });
+    if(!lines.length) return '';
+    if(rich) lines.push('没写到的部分保持未知，不要根据性别、身份或职业替角色补性格和能力');
+    return joinSentences(lines);
+  }
+  function proseWorld(s){
+    const w = s.world, lines = [];
+    const era = orCustom(w.era, w.eraCustom), wt = orCustom(w.type, w.typeCustom);
+    if(era || wt) lines.push('背景设定在' + [era, wt].filter(Boolean).join('的'));
+    const so = orCustom(w.social, w.socialCustom);
+    if(so) lines.push('两人之间存在' + so + '这样的身份差距');
+    if(val(w.charIdentity)) lines.push('CHAR 的身份是' + val(w.charIdentity));
+    if(val(w.userIdentity)) lines.push('USER 的身份是' + val(w.userIdentity));
+    const sc = uniq(nonEmpty(w.scenes).concat(splitList(w.sceneCustom)));
+    if(sc.length) lines.push('场景可以放在' + sc.join('、'));
+    const lit = nonEmpty(w.literary);
+    if(lit.length) lines.push('气质上参考' + lit.join('、') + '那种时代感、人物张力与叙事节奏，但不要复制原作的剧情和人物');
+    const scr = nonEmpty(w.screen);
+    if(scr.length) lines.push('节奏和画面参考' + scr.join('、') + '的感觉');
+    if(val(w.screenFeel)) lines.push('整体想要的感觉是' + val(w.screenFeel));
+    return joinSentences(lines);
+  }
+  function proseRelationship(s){
+    const r = s.relationship, lines = [];
+    const cur = orCustom(r.current, r.currentCustom);
+    if(cur) lines.push('两人现在的关系是' + cur + '，番外从这个状态开始');
+    const defs = Store.get('sliderDefs', DEFAULT_SLIDERS);
+    defs.forEach(d => {
+      const cfg = (r.sliders || {})[d.key];
+      if(!cfg || !cfg.on) return;
+      const v = typeof cfg.value === 'number' ? cfg.value : d.value;
+      if(d.key === 'initiative'){
+        const who = v < 35 ? nameA(s) : (v > 65 ? nameB(s) : null);
+        lines.push(who ? ('关系里的主动权更多在' + who + '一侧') : '两人的主动权大致均衡');
+        return;
+      }
+      const t = SLIDER_TEXT[d.key];
+      if(t) lines.push(t[band(v)].replace(/。$/, ''));
+      else lines.push('「' + d.name + '」偏向「' + (v > 50 ? d.max : d.min) + '」');
+    });
+    ROLE_QUESTIONS.forEach(q => {
+      const n = roleName(s, (r.roles || {})[q.key]);
+      if(n) lines.push(q.label + '是' + n);
+    });
+    return joinSentences(lines);
+  }
+  function proseTags(s){
+    const {translated, plain} = translateTags(s);
+    if(!translated.length && !plain.length) return '';
+    const chunks = [];
+    for(let i = 0; i < translated.length; i += 3){
+      chunks.push(joinSentences(translated.slice(i, i+3).map(t => t.text)));
+    }
+    if(plain.length) chunks.push('另外让这些方向自然存在于故事里：' + plain.join('、') + '。');
+    const head = translated.length ? '这一篇要抓住的感觉：' : '';
+    return (head ? head + '\n' : '') + chunks.join('\n');
+  }
+  function proseNarrative(s){
+    const n = s.narrative, lines = [];
+    const defs = Store.get('narrativeDefs', DEFAULT_NARRATIVE_SLIDERS);
+    defs.forEach(d => {
+      const cfg = (n.sliders || {})[d.key];
+      if(!cfg || !cfg.on) return;
+      const v = typeof cfg.value === 'number' ? cfg.value : d.value;
+      const t = NARRATIVE_TEXT[d.key];
+      if(t) lines.push(t[band(v)].replace(/。$/, ''));
+    });
+    const pov = orCustom(n.pov, n.povCustom);
+    if(pov) lines.push('用' + pov + '来写');
+    const st = nonEmpty(n.styles);
+    if(st.length) lines.push('风格偏' + st.join('、'));
+    const ig = orCustom(n.infoGap, n.infoGapCustom);
+    if(ig && ig !== '没有明显信息差') lines.push('信息差是' + ig + '，让它影响人物的判断和对话，不要靠旁白解释');
+    const moods = uniq(nonEmpty(s.vibe.moods).concat(splitList(s.vibe.custom)));
+    if(moods.length) lines.push('整体氛围偏' + moods.join('、'));
+    const v = s.visual, vb = [];
+    if(val(v.season)) vb.push(val(v.season));
+    if(val(v.time)) vb.push(val(v.time));
+    if(val(v.weather)) vb.push(val(v.weather));
+    if(val(v.tone)) vb.push(val(v.tone) + '的色调');
+    if(val(v.custom)) vb.push(val(v.custom));
+    if(vb.length) lines.push('画面基调是' + vb.join('、'));
+    const e = orCustom(s.ending, s.endingCustom);
+    if(e) lines.push('结局倾向' + e + '，但要由剧情自然导向，不要为了收尾硬转');
+    const x = s.extra;
+    if(x && x.on){
+      const hooks = uniq(nonEmpty(x.hooks).concat(splitList(x.custom)));
+      const lv = x.level || '轻';
+      lines.push('可以加一点' + (hooks.length ? hooks.join('、') : '不破坏走向的小意外') +
+        (lv === '轻' ? '，幅度小一点，只当点缀' : lv === '中' ? '，可以形成一个小转折' : '，可以大胆一些'));
+    }
+    return joinSentences(lines);
+  }
+  function proseLength(s){
+    const L = s.length || {};
+    const target = trim(L.custom) || (L.target && L.target !== '不限' ? L.target : '');
+    const lines = [];
+    if(target){
+      let main = '请以此展开写一篇番外，不少于' + target + '字';
+      if(L.strict) main += '，把这个字数当成最低线，不到不要收尾，不要用总结或跳时间压缩剧情，也不要虚报字数';
+      lines.push(main);
+    }else if(L.strict){
+      lines.push('内容要写足，不要用总结或跳时间压缩剧情，也不要提前收尾');
+    }
+    if(L.segmented) lines.push('一次写不完就停在自然的场景断点，下次从上一句无缝接着写');
+    if(L.countOutput) lines.push('正文写完后另起一行输出【输出总字数：XXXX字】，数字要按实际写出的正文统计，不要估算或虚报');
+    return joinSentences(lines);
+  }
+  function proseRules(s){
+    const lines = ['这段番外不计入主线，不要修改主线的事件、人物记忆和关系状态',
+                   '保持角色原本的人格、说话方式和行为逻辑，不要为了剧情让人 OOC',
+                   '没明确给的信息不要写成固定事实'];
+    if(nonEmpty(s.refuse).length) lines.push('另外这些绝对不要出现：' + nonEmpty(s.refuse).join('、'));
+    return joinSentences(lines);
+  }
+  function proseOutput(s){
+    return joinSentences(['直接开始正文，不要复述以上要求，不要写分析或大纲，也不要逐条打卡']);
+  }
+  function proseParts(s){
+    return {
+      CUSTOM_PROMPTS: buildCustomPrompts(s),
+      OPENING_COMMAND: buildOpening(s),
+      RULES: proseRules(s),
+      USER_IDEA: proseIdea(s),
+      CHARACTERS: proseCharacters(s),
+      WORLD: proseWorld(s),
+      RELATIONSHIP: proseRelationship(s),
+      TAGS: proseTags(s),
+      NARRATIVE: proseNarrative(s),
+      VIBE: '', VISUAL: '', ENDING: '', EXTRA: '',    // 自然模式里这些已经并进 NARRATIVE
+      LENGTH: proseLength(s),
+      OUTPUT: proseOutput(s),
+      FINAL: '',                                      // 自查清单在自然模式里不输出
+      REFUSE: '',
+      TITLE: trim(s.title)
+    };
+  }
+
   /* ---------- 组装 ---------- */
   function parts(s){
     const level = s.compileLevel || 'polish';
@@ -1465,7 +1660,7 @@ const Compiler = (function(){
     characters:['CHARACTERS'], world:['WORLD'], relationship:['RELATIONSHIP'], tags:['TAGS'],
     narrative:['NARRATIVE','VIBE','VISUAL','ENDING','EXTRA'], length:['LENGTH'], output:['OUTPUT'], final:['FINAL']
   };
-  function assembleModules(s, P){
+  function assembleModules(s, P, natural){
     const mods = Store.get('modules', DEFAULT_MODULES);
     const out = [];
     mods.forEach(m => {
@@ -1473,7 +1668,8 @@ const Compiler = (function(){
       if(m.custom){ if(trim(m.text)) out.push(trim(m.text)); return; }
       (MODULE_PARTS[m.key] || []).forEach(k => { if(trim(P[k])) out.push(trim(P[k])); });
     });
-    return out.join('\n\n');
+    /* 自然模式里各段是连着读的话，不要空行把它割成一块块 */
+    return out.join(natural ? '\n' : '\n\n');
   }
   function fillVars(text, P){
     return String(text || '').replace(/\{\{(\w+)\}\}/g, (m, key) => (P[key] !== undefined ? P[key] : ''));
@@ -1489,15 +1685,16 @@ const Compiler = (function(){
     return (b && b !== '{{MODULES}}') ? 'advanced' : 'wrap';
   }
   function render(s){
-    const P = parts(s);
-    P.MODULES = assembleModules(s, P);
+    const natural = (s.promptStyle || 'natural') !== 'structured';
+    const P = natural ? proseParts(s) : parts(s);
+    P.MODULES = assembleModules(s, P, natural);
     const tpl = Store.template(s.promptTemplateId);
     let out;
     if(templateMode(tpl) === 'advanced'){
       out = fillVars(trim(tpl.body) || '{{MODULES}}', P);
     }else{
       out = [fillVars(tpl && tpl.head, P), P.MODULES, fillVars(tpl && tpl.tail, P)]
-        .map(trim).filter(Boolean).join('\n\n');
+        .map(trim).filter(Boolean).join(natural ? '\n' : '\n\n');
     }
     return out.replace(/\n{3,}/g, '\n\n').replace(/[ \t]+\n/g, '\n').trim();
   }
@@ -2200,6 +2397,15 @@ function secPromptConfig(){
   if(s.openingExtraOn) body += fieldHTML('', '<textarea class="textarea" data-path="openingExtra">' + esc(s.openingExtra) + '</textarea>');
   body += '<div class="btnbar"><button class="btn xs ghost" data-act="save-opening-default">保存为默认</button>' +
           '<button class="btn xs ghost" data-act="reset-opening">恢复默认</button></div>';
+  body += '<div class="sec-title">输出形态</div>';
+  const styles = [
+    {v:'natural', t:'自然段落', d:'像自己写要求那样连着讲清楚这一篇要什么，最后一句篇幅要求。'},
+    {v:'structured', t:'分区块', d:'用【】把人物、关系、叙事、篇幅等分块列出来，条目清楚但更像配置表。'}
+  ];
+  const curStyle = s.promptStyle || 'natural';
+  body += '<div class="chips">' + styles.map(x =>
+    '<span class="chip' + (curStyle === x.v ? ' on' : '') + '" data-act="set-style" data-v="' + attr(x.v) + '">' + esc(x.t) + '</span>').join('') + '</div>';
+  body += '<div class="note mt8">' + esc((styles.find(x => x.v === curStyle) || {}).d || '') + '</div>';
   body += '<div class="sec-title">编译强度</div>';
   body += '<div class="chips">' + OPT.compileLevel.map(l =>
     '<span class="chip' + (s.compileLevel === l.v ? ' on' : '') + '" data-act="set-level" data-v="' + attr(l.v) + '" title="' + attr(l.d) + '">' + esc(l.t) + '</span>').join('') + '</div>';
@@ -2599,6 +2805,11 @@ const EditorActions = {
     Cur.compileLevel = el.dataset.v;
     await Store.saveStory(Cur); renderEditor();
   },
+  async 'set-style'(el){
+    Cur.promptStyle = el.dataset.v;
+    await Store.set('promptStyle', el.dataset.v);       // 记住选择，新番外跟着走
+    await Store.saveStory(Cur); renderEditor();
+  },
   async 'set-section'(el){
     Cur.section = el.dataset.v; Cur.folderId = null;
     await Store.saveStory(Cur); renderEditor();
@@ -2972,7 +3183,8 @@ Router.add('/modules', async () => {
 function renderModules(){
   const mods = Store.get('modules', DEFAULT_MODULES);
   view(
-    '<div class="callout">最终 Prompt 由这些模块按顺序组合（对应模板里的 <code>{{MODULES}}</code>）。关掉的模块不会出现，内容为空的模块会自动省略。</div>' +
+    '<div class="callout">最终 Prompt 由这些模块按顺序组合（对应模板里的 <code>{{MODULES}}</code>）。关掉的模块不会出现，内容为空的模块会自动省略。<br>' +
+      '「自然段落」形态下顺序照样生效，只是每个模块写成连贯的话而不是分区块；氛围、视觉、结局、加料会并进「叙事要求」，「最终检查」不输出。</div>' +
     '<div class="btnbar mb12">' +
       '<button class="btn sm" data-act="mod-add">' + icon('plus','sm') + '添加自定义模块</button>' +
       '<button class="btn sm ghost" data-act="mod-reset">恢复默认顺序</button>' +
@@ -3000,7 +3212,7 @@ function renderModules(){
    12. 预设 / 语义词典 / 标签池 / 滑块
    ============================================================ */
 const PRESET_FIELDS = ['tags','customTags','characters','relationship','world','narrative','vibe','visual',
-  'ending','endingCustom','extra','refuse','length','customPromptIds','promptTemplateId','compileLevel',
+  'ending','endingCustom','extra','refuse','length','customPromptIds','promptTemplateId','compileLevel','promptStyle',
   'opening','openingExtra','openingExtraOn'];
 
 function presetFromStory(s, name, desc){
@@ -3253,45 +3465,33 @@ async function editApiModal(a){
         name, provider: trim($('#ap-provider', m).value), baseUrl: trim($('#ap-url', m).value),
         apiKey: trim($('#ap-key', m).value), model: trim($('#ap-model', m).value),
         temperature: Number($('#ap-temp', m).value), maxTokens: Number($('#ap-max', m).value),
-        customParams: params, models: modelList.slice(0, 500)
+        customParams: params, models: modelList.slice()
       };
     }}],
     onMount:(m) => {
       const box = $('#ap-models', m);
-      const paint = (filter) => {
+      /* 拉到的模型全部列在下拉框里，不截断 */
+      const paint = () => {
         if(!modelList.length){ box.innerHTML = ''; return; }
-        const kw = trim(filter).toLowerCase();
-        const hit = kw ? modelList.filter(x => x.toLowerCase().indexOf(kw) >= 0) : modelList;
-        const shown = hit.slice(0, 60);
+        const cur = trim($('#ap-model', m).value);
         box.innerHTML =
-          '<div class="note mb8">拉到 ' + modelList.length + ' 个模型' +
-            (hit.length !== modelList.length ? '，匹配 ' + hit.length + ' 个' : '') + '，点一个填进去</div>' +
-          (modelList.length > 12
-            ? '<input class="input mb8" id="ap-mfilter" placeholder="筛选模型名" value="' + attr(filter || '') + '">' : '') +
-          '<div class="chips">' + shown.map(x =>
-            '<span class="chip' + (x === trim($('#ap-model', m).value) ? ' on' : '') + '" data-model="' + attr(x) + '">' +
-              esc(x) + '</span>').join('') + '</div>' +
-          (hit.length > shown.length ? '<div class="note mt8">还有 ' + (hit.length - shown.length) + ' 个，用上面的框筛一下</div>' : '');
-        const f = $('#ap-mfilter', m);
-        if(f){
-          f.addEventListener('input', debounce(() => {
-            const pos = f.selectionStart; paint(f.value);
-            const nf = $('#ap-mfilter', m); if(nf){ nf.focus(); nf.setSelectionRange(pos, pos); }
-          }, 200));
-        }
-        box.querySelectorAll('[data-model]').forEach(c => c.addEventListener('click', () => {
-          $('#ap-model', m).value = c.dataset.model;
-          paint(f ? f.value : '');
-        }));
+          '<select class="input" id="ap-mselect">' +
+            '<option value="">选一个模型（共 ' + modelList.length + ' 个）</option>' +
+            modelList.map(x => '<option value="' + attr(x) + '"' + (x === cur ? ' selected' : '') + '>' + esc(x) + '</option>').join('') +
+          '</select>' +
+          '<div class="note mt8">选了会填进上面的 Model；也可以自己手打。</div>';
+        $('#ap-mselect', m).addEventListener('change', (ev) => {
+          if(ev.target.value) $('#ap-model', m).value = ev.target.value;
+        });
       };
-      paint('');
+      paint();
       $('#ap-fetch', m).addEventListener('click', async () => {
         const btn = $('#ap-fetch', m);
         btn.disabled = true; btn.textContent = '拉取中…';
         box.innerHTML = '';
         try{
           modelList = await Api.models({baseUrl: $('#ap-url', m).value, apiKey: $('#ap-key', m).value});
-          paint('');
+          paint();
           toast('拉到 ' + modelList.length + ' 个模型');
         }catch(err){
           box.innerHTML = '<div class="callout warn">' + esc(err.message) + '</div>';
