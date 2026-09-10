@@ -422,6 +422,7 @@ input[type=range].off::-webkit-slider-thumb{border-color:var(--muted)}
   <a class="dlink" href="#/taste"><svg class="icon"><use href="#i-chart"/></svg>口味画像</a>
   <a class="dlink" href="#/api"><svg class="icon"><use href="#i-key"/></svg>API 设置</a>
   <a class="dlink" href="#/data"><svg class="icon"><use href="#i-save"/></svg>数据备份</a>
+  <div class="dtitle" style="margin-top:auto;padding-top:18px" id="build-stamp"></div>
 </nav>
 
 <div class="modal-mask" id="modal-mask"><div class="modal" id="modal"></div></div>
@@ -668,6 +669,7 @@ const DB = (function(){
 /* ============================================================
    2. 默认数据
    ============================================================ */
+const BUILD_VERSION = 'v9 · 2026-09-10';   // 抽屉底部会显示，用来确认打开的是哪一版
 const OPENING_DEFAULT = '$暂停当前剧情生成一个番外，不计入主线。';
 const OPENING_EXTRA_DEFAULT = '暂时脱离当前主线剧情，生成一个独立番外。本番外不计入主线剧情，不修改、不覆盖、不追加主线事件、人物记忆或关系状态。番外内部可以拥有独立的时间线、背景和剧情发展。番外结束后恢复主线，不将本次番外内容自动带回主线。';
 
@@ -2444,8 +2446,10 @@ function secTags(){
   }
   cats.forEach(c => {
     const sel = (s.tags[c.key] || []);
-    const addChip = '<span class="chip add" data-act="add-cat-tag" data-id="' + attr(c.id) + '">' + icon('plus','sm') + '添加</span>';
-    const chips = chipsHTML(c.tags, sel, {tagcat: c.key}).replace(/<\/div>$/, addChip + '</div>');
+    const addChip = '<span class="chip add" data-act="add-cat-tag" data-id="' + attr(c.id) + '">' + icon('plus','sm') + '添加</span>' +
+      '<span class="chip add" data-act="tag-ai" data-id="' + attr(c.id) + '">' + icon('spark','sm') + 'AI 生成</span>';
+    /* 放在最前面：标签一多，挂在末尾就得划到底才看得见 */
+    const chips = chipsHTML(c.tags, sel, {tagcat: c.key}).replace('<div class="chips">', '<div class="chips">' + addChip);
     html += foldHTML('tag-' + c.key, c.name, sel.length ? sel.join('、') : '',
       chips, sel.length > 0 || c.key === 'emotion');
   });
@@ -3976,7 +3980,8 @@ Router.add('/data', async () => {
     预设: Store.presets.length, 词典: Store.lexicon.length, 标签分类: Store.tagCats.length, API配置: Store.apis.length
   };
   view(
-    '<div class="callout">全部数据都存在这台设备的浏览器里。换设备或清理浏览器前，记得先导出一份备份。</div>' +
+    '<div class="callout">全部数据都存在这台设备的浏览器里。换设备或清理浏览器前，记得先导出一份备份。<br>' +
+      '<span class="muted">当前版本：' + esc(BUILD_VERSION) + '</span></div>' +
     '<div class="stats mb12">' + Object.keys(counts).map(k =>
       '<div class="stat"><div class="sv">' + counts[k] + '</div><div class="sl">' + esc(k) + '</div></div>').join('') + '</div>' +
     '<div class="btnbar mb12">' +
@@ -4884,6 +4889,8 @@ GlobalActions['api-use'] = async function(el){
    20. 启动
    ============================================================ */
 (async function init(){
+  const stamp = $('#build-stamp');
+  if(stamp) stamp.textContent = BUILD_VERSION;
   try{
     await Store.load();
   }catch(e){
