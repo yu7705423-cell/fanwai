@@ -942,23 +942,15 @@ const Store = {
       this.folders = base.map((f,i) => ({id:uid(), name:f.name, section:f.section, order:i, createdAt:now()}));
       await DB.bulkPut('folders', this.folders);
     }
-    if(!this.presets.length){
-      const p = {
-        id:'preset_default_1', name:'嘴硬迟钝', builtin:true, order:0, createdAt:now(), updatedAt:now(),
-        desc:'CHAR 克制嘴硬 / USER 迟钝天然 / 欢喜冤家 + 暗恋 / 吃醋高、暧昧高、主动权偏 CHAR',
-        data:{
-          tags:{emotion:['单向暗恋','明明在意却不说'], relation:['欢喜冤家','互相嘴硬'], mood:['吃醋','嘴上否认行动明显','当事人自己还没意识到'], plot:[], au:[], skit:[]},
-          characters:{mode:'dual',
-            char:{name:'',gender:'未指定',orientation:'未指定',age:'未指定',identity:'未指定',job:'',social:'',personality:['克制','嘴硬'],temperament:'',extra:''},
-            user:{name:'',gender:'未指定',orientation:'未指定',age:'未指定',identity:'未指定',job:'',social:'',personality:[],temperament:'迟钝、天然',extra:''},
-            others:[], relations:[]},
-          relationship:{current:'欢喜冤家',
-            sliders:{jealous:{value:85,on:true}, ambiguous:{value:80,on:true}, initiative:{value:20,on:true}},
-            roles:{initiator:'A', firstLove:'A', jealousOne:'A', softOne:'A', inControl:'A'}}
-        }
-      };
-      this.presets = [p];
-      await DB.put('presets', p);
+    /* 不预置任何示例预设：预设是各人自己的一整套配置，塞一个进去只会碍事。
+       之前版本装过的那条示例，在这里一次性清掉，清完做标记，不会再回来。 */
+    if(this.settings.demoPresetRemoved !== true){
+      const demo = this.presets.find(x => x.id === 'preset_default_1');
+      if(demo){
+        this.presets = this.presets.filter(x => x.id !== 'preset_default_1');
+        await DB.del('presets', 'preset_default_1');
+      }
+      await this.set('demoPresetRemoved', true);
     }
     if(this.settings.openingCommand === undefined) await this.set('openingCommand', OPENING_DEFAULT);
     if(this.settings.openingExtra === undefined)   await this.set('openingExtra', OPENING_EXTRA_DEFAULT);
