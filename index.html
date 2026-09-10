@@ -2341,6 +2341,7 @@ function storyItemHTML(s, opts){
       '<button class="iconbtn" data-act="fav" title="收藏">' + icon('star','sm') + '</button>' +
       '<button class="iconbtn" data-act="copy" title="复制 Prompt">' + icon('copy','sm') + '</button>' +
       '<button class="iconbtn" data-act="detail" title="查看详情">' + icon('eye','sm') + '</button>' +
+      (opts.deletable ? '<button class="iconbtn" data-act="del" title="删除">' + icon('trash','sm') + '</button>' : '') +
     '</div></div>';
 }
 function bindStoryItems(){
@@ -2357,6 +2358,14 @@ function bindStoryItems(){
         if(btn.dataset.act === 'fav'){
           s.favorite = !s.favorite; await Store.saveStory(s);
           toast(s.favorite ? '已收藏' : '已取消收藏'); Router.go();
+        }else if(btn.dataset.act === 'del'){
+          const ok = await confirmBox('删除番外', '确定删除「' + (trim(s.title) || '未命名') + '」？删掉就没有了。', '删除', true);
+          if(!ok) return;
+          await Store.delStory(id);
+          if(Cur && Cur.id === id) Cur = null;
+          LibState.sel.delete(id);
+          toast('已删除');
+          Router.current === '/library' ? renderLibrary() : Router.go();
         }else if(btn.dataset.act === 'detail'){
           nav('/detail/' + id);
         }else if(btn.dataset.act === 'copy'){
@@ -2663,6 +2672,8 @@ function secLibrary(){
     body += fieldHTML('备注', '<input class="input" data-path="sourceInfo.note" value="' + attr(s.sourceInfo.note) + '">');
   }
   body += fieldHTML('我的备注', '<textarea class="textarea" data-path="notes">' + esc(s.notes) + '</textarea>');
+  body += '<div class="hr"></div>' +
+    '<div class="btnbar"><button class="btn sm danger" data-act="del-story">' + icon('trash','sm') + '删除这个番外</button></div>';
   return foldHTML('lib', '归档信息', (s.section === 'my' ? '我的番外' : '他人分享'), body, false);
 }
 
@@ -3161,6 +3172,16 @@ const EditorActions = {
     autosave.flush(); await Store.saveStory(Cur);
     toast('已保存'); const el = $('#save-hint'); if(el) el.textContent = '已保存 ' + fmtDate(Cur.updatedAt);
   },
+  async 'del-story'(){
+    const title = trim(Cur.title) || '未命名';
+    if(!await confirmBox('删除番外', '确定删除「' + title + '」？删掉就没有了。', '删除', true)) return;
+    const id = Cur.id;
+    autosave.flush();
+    Cur = null;
+    await Store.delStory(id);
+    toast('已删除');
+    nav('/library');
+  },
   async 'save-ver'(){
     const text = currentPromptText();
     Cur.promptVersions.push({v:Cur.promptVersions.length+1, createdAt:now(), understanding:Compiler.understanding(Cur),
@@ -3260,7 +3281,8 @@ function renderLibrary(){
         '</div></div>'
       : '') +
     (list.length
-      ? list.map(s => storyItemHTML(s, {selectable: LibState.batch, checked: LibState.sel.has(s.id)})).join('')
+      ? list.map(s => storyItemHTML(s, {selectable: LibState.batch, checked: LibState.sel.has(s.id),
+          deletable: !LibState.batch})).join('')
       : emptyHTML(LibState.q ? '没有匹配的番外' : '这里还是空的', 'book')) +
     '<div class="note tac mt16">共 ' + list.length + ' 条</div>'
   );
